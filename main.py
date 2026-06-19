@@ -19,7 +19,10 @@ from bs4 import BeautifulSoup
 from jinja2 import Template
 
 # ──────────────────────────────────────────────────────────────
-# LOGGING SETUP  (bootstrapped before config so errors are captured)
+# LOGGING SETUP : Before the AI Agent is even useable, this function captures:
+# -runtime errors 
+# scraping failures: agent tries to collect data from the interent and something foeswrong (website is down, wrong URL, etc.)
+# API + other errors: calling json api instead of a webpage, etc. 
 # ──────────────────────────────────────────────────────────────
 
 def setup_logging(level: str = "INFO", log_file: str = "agent.log") -> None:
