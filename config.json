@@ -1,0 +1,21 @@
+{
+  "keywords": {
+    "required": [],
+    "optional": [],
+    "excluded": []
+  },
+  "certification": [],
+  "geographic_scope": [],
+  "budget_range": {
+    "contracts": {
+      "min": null,
+      "max": null
+    },
+    "grants": {
+      "min": null,
+      "max": null
+    }
+  },
+  "target_agencies": [],
+  "state_portals": []
+}
