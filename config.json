@@ -1,21 +1,141 @@
 {
   "keywords": {
-    "required": [],
-    "optional": [],
-    "excluded": []
+    "required": {
+      "certification&security": [
+        "HIPAA-compliant data environment", 
+        "Secure Azure-hosted infrastructure", 
+        "Data security/privacy compliance",
+        "Secure data hub"
+      ],
+      "geographic_scope":[
+        "Western New York", 
+        "Buffalo New York", 
+        "Upstate New York", 
+        "New Jersey", 
+        "Monmouth County New Jersey", 
+        "Chicago Illinois", 
+        "Cook County Illinois", 
+        "West Virginia", 
+        "National expansion", 
+        "Nationwide coverage", 
+        "All 50 states", 
+        "Multi-state deployment", 
+        "National scalability", 
+        "Every US ZIP code", 
+        "Cross-jurisdictional data sharing", 
+        "Federal-level data compliance"
+      ],
+      "core_infrastructure":[
+        "Interoperability", 
+        "Data interoperability", 
+        "Interoperable systems", 
+        "Data sharing platform", 
+        "Single source of record"
+      ]
+    },
+
+
+    "optional": {
+      "referral&intake_mechanics":[
+        "Closed-loop referrals", 
+        "Closed-loop referral", 
+        "Referral management", 
+        "Referral closure rate", 
+        "Shared/unified intake", 
+        "Shared intake", "Coordinated entry", 
+        "Resource directory", "Local resource directory", 
+        "Real-time data exchange"
+      ],
+      "care&case_management":[
+        "Care coordination", 
+        "Coordinated care", 
+        "Case management", 
+        "Case management system", 
+        "Client/participant tracking", 
+        "Whole-person care", 
+        "Holistic care", 
+        "Integrated care model", 
+        "Clinical-community linkage", 
+        "Care gaps closure"
+
+      ],
+      "collaboration&community":[
+        "Cross-org collaboration", 
+        "Cross-agency data sharing", 
+        "Multi-agency collaboration", 
+        "Cross-sector collaboration", 
+        "City-CBO partnership", 
+        "Social services integration", 
+        "Health and human services integration", 
+        "Community resource network", 
+        "Community health infrastructure", 
+        "Community-owned data", 
+        "Community voice/co-design", 
+        "Collective impact"
+      ],
+      "data&metrics&value":[
+        "Social determinants of health (SDOH)", 
+        "Health equity", 
+        "Equity-focused service delivery", 
+        "Equity and access", 
+        "Population health", 
+        "Value-based care", 
+        "Member outcomes", 
+        "Outcomes measurement", 
+        "Outcomes reporting", 
+        "Outcome measurement framework", 
+        "Performance metrics", 
+        "ROI/cost avoidance", 
+        "Evidence-based practice"
+      ],
+      "scale&startedgy&funding":[
+        "Systems change", 
+        "Capacity building", 
+        "CBO-led innovation", 
+        "Civic technology", 
+        "Municipal programming", 
+        "Resident services", 
+        "Neighborhood-level data", 
+        "Public-private collaboration", 
+        "Sustainable funding model", 
+        "Sustainability plan", 
+        "Scalable solution", 
+        "Replicable model", 
+        "Grant compliance reporting"
+      ]
+    },
+
+
+    "excluded": [
+      "HMIS-adjacent",
+      "EHR",
+      "EMR",
+      "Electronic Health Record",
+      "ERP",
+      "Enterpise Resource Planning",
+      "International",
+      "Global"
+    ]
   },
-  "certification": [],
-  "geographic_scope": [],
+  
   "budget_range": {
     "contracts": {
       "min": null,
       "max": null
     },
+    
     "grants": {
       "min": null,
       "max": null
     }
   },
+
   "target_agencies": [],
-  "state_portals": []
+
+  "state_portals": {
+    "name":"Special Supplemental Nutrition Program for Women, Infants and Children (WIC) – Training Services for the Bureau of Supplemental Food Programs",
+    "url":"https://www.health.ny.gov/funding/rfp/c042783/",
+    "type": "web",
+    "enabled": false
+  }
 }
