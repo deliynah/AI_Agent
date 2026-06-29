@@ -4,3 +4,4 @@ __pycache__/
 agent.log
 opportunities.db
 reports/
+rejection_debug.html

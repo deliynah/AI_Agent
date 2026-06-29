@@ -3,12 +3,15 @@ RFP & Grant Opportunity AI Agent
 Scrapes, filters, evaluates, stores, and reports on opportunities.
 """
 
+import argparse
 import json
 import logging
 import os
 import re
 import sqlite3
+import webbrowser
 import xml.etree.ElementTree as ET
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
@@ -777,6 +780,194 @@ def send_notifications(opportunities: list[dict], report_path: str, config: dict
 
 
 # ──────────────────────────────────────────────────────────────
+# REJECTION DEBUGGER
+# ──────────────────────────────────────────────────────────────
+
+_DEBUG_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RFP Rejection Debugger</title>
+  <style>
+    {% macro bcls(cat) %}{% if 'cert' in cat %}badge-cert{% elif 'geo' in cat %}badge-geo{% elif 'core' in cat %}badge-core{% else %}badge-excl{% endif %}{% endmacro %}
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; background: #fff; color: #222; max-width: 1500px; margin: 0 auto; padding: 32px 24px; }
+    h1 { color: #1a2638; border-bottom: 3px solid #e74c3c; padding-bottom: 10px; margin-bottom: 6px; }
+    h2 { color: #1a2638; font-size: 1.1em; margin: 28px 0 12px; }
+    .subtitle { color: #666; font-size: 0.9em; margin-bottom: 32px; }
+    .summary-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 32px; }
+    .stat { background: #f4f6f8; border-radius: 8px; padding: 16px 24px; text-align: center; min-width: 150px; }
+    .stat .num { font-size: 2.2em; font-weight: bold; color: #1a2638; line-height: 1.1; }
+    .stat .lbl { font-size: 0.8em; color: #666; margin-top: 4px; }
+    .breakdown-grid { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 36px; }
+    .bk-card { background: #f9f9f9; border-radius: 8px; padding: 12px 20px; display: flex; align-items: center; gap: 14px; }
+    .bk-card .bk-count { font-size: 1.6em; font-weight: bold; color: #1a2638; }
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.82em; font-weight: bold; white-space: nowrap; }
+    .badge-cert { background: #fde8e8; color: #c0392b; }
+    .badge-geo  { background: #fff3cd; color: #856404; }
+    .badge-core { background: #dbeafe; color: #1e40af; }
+    .badge-excl { background: #f3e8ff; color: #6d28d9; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+    thead th { background: #1a2638; color: #fff; padding: 10px 14px; text-align: left; white-space: nowrap; }
+    tbody tr:nth-child(even) { background: #fafafa; }
+    tbody tr:hover { background: #f0f5ff; }
+    td { padding: 9px 14px; vertical-align: top; border-bottom: 1px solid #eee; }
+    .title-cell { font-weight: 600; max-width: 220px; word-break: break-word; }
+    .url-cell { max-width: 160px; word-break: break-all; font-size: 0.8em; }
+    .kw-cell { max-width: 280px; }
+    .snippet-cell { max-width: 360px; font-size: 0.82em; color: #444; line-height: 1.5; word-break: break-word; }
+    .kw-list { display: flex; flex-wrap: wrap; gap: 4px; }
+    .kw-tag { background: #eef0f2; border-radius: 4px; padding: 2px 7px; font-size: 0.78em; color: #555; }
+    .kw-tag.hit { background: #fde8e8; color: #c0392b; font-weight: bold; }
+    a { color: #2e86de; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+{% macro bcls(cat) %}{% if 'cert' in cat %}badge-cert{% elif 'geo' in cat %}badge-geo{% elif 'core' in cat %}badge-core{% else %}badge-excl{% endif %}{% endmacro %}
+  <h1>RFP Rejection Debugger</h1>
+  <p class="subtitle">Generated: <strong>{{ report_date }}</strong> &nbsp;&middot;&nbsp; Shows exactly why each RFP failed the keyword filter &mdash; use this to tune config.json</p>
+
+  <div class="summary-row">
+    <div class="stat"><div class="num">{{ total_scraped }}</div><div class="lbl">Total Scraped</div></div>
+    <div class="stat"><div class="num">{{ total_rejected }}</div><div class="lbl">Rejected by Filter</div></div>
+    <div class="stat"><div class="num">{{ total_passed }}</div><div class="lbl">Passed Filter</div></div>
+  </div>
+
+  <h2>Failure Breakdown by Category</h2>
+  <div class="breakdown-grid">
+    {% for cat, count in breakdown.items() %}
+    <div class="bk-card">
+      <div class="bk-count">{{ count }}</div>
+      <span class="badge {{ bcls(cat) }}">{{ cat }}</span>
+    </div>
+    {% endfor %}
+  </div>
+
+  <h2>All Rejections ({{ total_rejected }})</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Title</th>
+          <th>URL</th>
+          <th>Failed Category</th>
+          <th>Keywords Checked</th>
+          <th>Text Searched</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rejections %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td class="title-cell">{{ r.title or "(no title)" }}</td>
+          <td class="url-cell">
+            {% if r.url %}<a href="{{ r.url }}" target="_blank" rel="noopener">{{ r.url[:55] }}{% if r.url | length > 55 %}&hellip;{% endif %}</a>{% else %}&mdash;{% endif %}
+          </td>
+          <td><span class="badge {{ bcls(r.failed_category) }}">{{ r.failed_category }}</span></td>
+          <td class="kw-cell">
+            <div class="kw-list">
+              {% for kw in r.keywords_checked %}<span class="kw-tag{% if r.triggered_keyword == kw %} hit{% endif %}">{{ kw }}</span>{% endfor %}
+            </div>
+          </td>
+          <td class="snippet-cell">{{ r.text_snippet or "(empty)" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>"""
+
+
+def debug_keyword_filter(opportunities: list[dict], config: dict) -> tuple[list[dict], list[dict]]:
+    keywords = config.get("keywords", {})
+    required_categories = {
+        category: [kw.lower() for kw in kws]
+        for category, kws in keywords.get("required", {}).items()
+    }
+    optional_keywords = [
+        kw.lower()
+        for kws in keywords.get("optional", {}).values()
+        for kw in kws
+    ]
+    excluded = [kw.lower() for kw in keywords.get("excluded", [])]
+
+    passed: list[dict] = []
+    rejections: list[dict] = []
+
+    for opp in opportunities:
+        raw_text = opp.get("title", "") + " " + opp.get("description", "")
+        text = raw_text.lower()
+        snippet = raw_text[:400].strip()
+
+        triggered_excl = next((kw for kw in excluded if kw in text), None)
+        if triggered_excl:
+            rejections.append({
+                "title": opp.get("title", ""),
+                "url": opp.get("source_url", ""),
+                "failed_category": "excluded",
+                "keywords_checked": excluded,
+                "triggered_keyword": triggered_excl,
+                "text_snippet": snippet,
+            })
+            continue
+
+        rejected = False
+        for category, kws in required_categories.items():
+            if not any(kw in text for kw in kws):
+                rejections.append({
+                    "title": opp.get("title", ""),
+                    "url": opp.get("source_url", ""),
+                    "failed_category": category,
+                    "keywords_checked": kws,
+                    "triggered_keyword": None,
+                    "text_snippet": snippet,
+                })
+                rejected = True
+                break
+
+        if not rejected:
+            optional_matches = sum(1 for kw in optional_keywords if kw in text)
+            opp["keyword_score"] = round(optional_matches / len(optional_keywords), 2) if optional_keywords else 0.0
+            passed.append(opp)
+
+    return passed, rejections
+
+
+def generate_debug_report(total_scraped: int, rejections: list[dict]) -> str:
+    breakdown = dict(Counter(r["failed_category"] for r in rejections))
+    report_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    filepath = "rejection_debug.html"
+
+    html = Template(_DEBUG_TEMPLATE).render(
+        report_date=report_date,
+        total_scraped=total_scraped,
+        total_rejected=len(rejections),
+        total_passed=total_scraped - len(rejections),
+        breakdown=breakdown,
+        rejections=rejections,
+    )
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    logger.info(f"Debug report saved: {filepath} ({len(rejections)}/{total_scraped} rejections)")
+    return filepath
+
+
+def run_debug(config: dict) -> None:
+    logger.info("=== REJECTION DEBUGGER ===")
+    raw = scrape_all(config)
+    _, rejections = debug_keyword_filter(raw, config)
+    filepath = generate_debug_report(len(raw), rejections)
+    webbrowser.open(Path(filepath).resolve().as_uri())
+
+
+# ──────────────────────────────────────────────────────────────
 # PIPELINE
 # ──────────────────────────────────────────────────────────────
 
@@ -834,25 +1025,32 @@ def start_scheduler(config: dict) -> None:
 # ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Bootstrap logging before config is available
     setup_logging()
-
     load_dotenv()
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+
+    parser = argparse.ArgumentParser(description="RFP & Grant Opportunity AI Agent")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Run keyword-filter rejection debugger and output rejection_debug.html (no LLM calls)",
+    )
+    args = parser.parse_args()
+
+    if not args.debug and not os.environ.get("ANTHROPIC_API_KEY"):
         raise RuntimeError(
             "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and fill in your key."
         )
 
     config = load_config("config.json")
-
-    # Re-initialise logging with values from config
     log_cfg = config.get("logging", {})
     setup_logging(
         level=log_cfg.get("level", "INFO"),
         log_file=log_cfg.get("file", "agent.log"),
     )
 
-    if config.get("scheduler", {}).get("enabled", False):
+    if args.debug:
+        run_debug(config)
+    elif config.get("scheduler", {}).get("enabled", False):
         start_scheduler(config)
     else:
         run_pipeline(config)
