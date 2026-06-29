@@ -359,6 +359,38 @@ def _parse_llm_response(text: str) -> dict:
     return result
 
 
+_EVALUATION_TOOL = {
+    "name": "evaluate_opportunity",
+    "description": "Return a structured evaluation of an RFP or grant opportunity.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "relevance_score": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "Relevance score from 1 (not relevant) to 10 (perfect fit).",
+            },
+            "summary": {
+                "type": "string",
+                "description": "1-2 sentence overview of why this is or isn't a good fit.",
+            },
+            "red_flags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Concerns such as sole-source requirements, mismatched scope, or unclear budget. Empty array if none.",
+            },
+            "win_likelihood": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": "Estimated probability of winning this opportunity.",
+            },
+        },
+        "required": ["relevance_score", "summary", "red_flags", "win_likelihood"],
+    },
+}
+
+
 def llm_evaluate(opportunities: list[dict], config: dict) -> list[dict]:
     logger.info("=== STAGE: LLM EVALUATION ===")
 
@@ -379,21 +411,35 @@ def llm_evaluate(opportunities: list[dict], config: dict) -> list[dict]:
                 prompt = (
                     f"Evaluate this opportunity for {company_profile.get('name', 'our company')}.\n\n"
                     f"Title: {opp.get('title', '')}\n"
-                    f"Description: {opp.get('description', '')[:1500]}\n\n"
-                    "Respond with a JSON block containing:\n"
-                    "  relevance_score (integer 1-10)\n"
-                    "  summary (1-2 sentence overview)\n"
-                    "  red_flags (list of strings, empty list if none)\n"
-                    "  win_likelihood (\"low\", \"medium\", or \"high\")"
+                    f"Description: {opp.get('description', '')[:1500]}"
                 )
 
             message = client.messages.create(
                 model=model,
                 max_tokens=1024,
+                tools=[_EVALUATION_TOOL],
+                tool_choice={"type": "tool", "name": "evaluate_opportunity"},
                 messages=[{"role": "user", "content": prompt}],
             )
-            response_text = message.content[0].text
-            scores = _parse_llm_response(response_text)
+
+            tool_block = next(
+                (block for block in message.content if block.type == "tool_use"),
+                None,
+            )
+            if tool_block:
+                inp = tool_block.input
+                scores = {
+                    "relevance_score": min(10, max(1, int(inp.get("relevance_score", 0)))),
+                    "summary": str(inp.get("summary", "")),
+                    "red_flags": list(inp.get("red_flags", [])),
+                    "win_likelihood": str(inp.get("win_likelihood", "low")).lower(),
+                }
+            else:
+                response_text = next(
+                    (block.text for block in message.content if hasattr(block, "text")),
+                    "",
+                )
+                scores = _parse_llm_response(response_text)
 
             if scores["relevance_score"] < min_score:
                 logger.info(

@@ -164,7 +164,7 @@
     "min_days_until_deadline": 7,
     "max_days_until_deadline": 365,
     "flag_sole_source": true,
-    "evaluation_prompt_template": "You are evaluating an RFP/grant opportunity for {name}, the company behind {platform}.\n\nCompany profile:\n{mission}\n\nKeyword match score (0-1, higher = more keyword overlap with our focus areas): {keyword_score}\n\nOpportunity:\nTitle: {title}\nAgency/Funder: {agency_or_funder}\nDeadline: {deadline}\nEstimated Value: {estimated_value}\nDescription: {description}\n\nEvaluate how well this opportunity fits {name} and {platform}. Respond with ONLY a JSON code block of the form:\n```json\n{{\n  \"relevance_score\": <integer 1-10>,\n  \"summary\": \"<1-2 sentence overview of why this is or isn't a good fit>\",\n  \"red_flags\": [\"<any concerns, e.g. sole-source, mismatched scope, unclear budget>\"],\n  \"win_likelihood\": \"low|medium|high\"\n}}\n```"
+    "evaluation_prompt_template": "You are evaluating an RFP/grant opportunity for {name}, the company behind {platform}.\n\nCompany profile:\n{mission}\n\nKeyword match score (0-1, higher = more keyword overlap with our focus areas): {keyword_score}\n\nOpportunity:\nTitle: {title}\nAgency/Funder: {agency_or_funder}\nDeadline: {deadline}\nEstimated Value: {estimated_value}\nDescription: {description}\n\nEvaluate how well this opportunity fits {name} and {platform}. Consider: relevance to our data-sharing and SDOH mission, geographic fit, realistic win likelihood, and any red flags such as sole-source requirements or mismatched scope."
   },
 
   "output": {

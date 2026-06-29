@@ -90,8 +90,9 @@ New logic:
   `summary`, `red_flags`, `win_likelihood`).
 - **2.2** Fold `keyword_score` from Phase 1 into the prompt as a signal. Default model:
   `claude-sonnet-4-6` (or `claude-opus-4-8` for higher-quality judgment at higher cost).
-- **2.3** (Optional hardening) Use Claude tool-use / structured output for deterministic
-  JSON parsing.
+- **2.3** ✅ DONE — Claude tool-use for deterministic JSON parsing. Added `_EVALUATION_TOOL`
+  schema to `main.py` and switched `llm_evaluate` to `tool_choice={"type":"tool","name":"evaluate_opportunity"}`.
+  Claude is now forced to return a typed struct; `_parse_llm_response` remains as a text fallback only.
 
   -personal notes: 
     -instructions Claude recieves when judging whether grant is good fit fore wellconnected
