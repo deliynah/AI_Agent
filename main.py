@@ -11,11 +11,13 @@ import sqlite3
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin
 
 import anthropic
 import requests
 from apscheduler.schedulers.blocking import BlockingScheduler
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from jinja2 import Template
 
 # ──────────────────────────────────────────────────────────────
@@ -47,11 +49,10 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────
 
 REQUIRED_TOP_KEYS = [
-    "company_profile",
-    "search_criteria",
-    "scraping_sources",
-    "evaluation",
-    "output",
+    "keywords",
+    "budget_range",
+    "target_agencies",
+    "scraping_sources"
 ]
 
 
@@ -187,7 +188,7 @@ def scrape_web(source: dict) -> list[dict]:
 
         selectors = source.get("selectors", {})
         listing_sel = selectors.get("listing", "article")
-        base_url = source["url"].rstrip("/")
+        base_url = source["url"]
 
         def _text(el, sel: str) -> str:
             node = el.select_one(sel) if sel else None
@@ -198,7 +199,7 @@ def scrape_web(source: dict) -> list[dict]:
             if node is None:
                 return base_url
             href = node.get("href", "")
-            return href if href.startswith("http") else base_url + "/" + href.lstrip("/")
+            return urljoin(base_url, href) if href else base_url
 
         opportunities = []
         for listing in soup.select(listing_sel):
@@ -256,19 +257,45 @@ def scrape_all(config: dict) -> list[dict]:
 def keyword_filter(opportunities: list[dict], config: dict) -> list[dict]:
     logger.info("=== STAGE: KEYWORD FILTER ===")
 
-    criteria = config.get("search_criteria", {})
-    must_have = [kw.lower() for kw in criteria.get("must_have_keywords", [])]
-    excluded = [kw.lower() for kw in criteria.get("excluded_keywords", [])]
+    keywords = config.get("keywords", {})
+    required_categories = {
+        category: [kw.lower() for kw in kws]
+        for category, kws in keywords.get("required", {}).items()
+    }
+    optional_keywords = [
+        kw.lower()
+        for kws in keywords.get("optional", {}).values()
+        for kw in kws
+    ]
+    excluded = [kw.lower() for kw in keywords.get("excluded", [])]
 
     passed: list[dict] = []
     for opp in opportunities:
         text = (opp.get("title", "") + " " + opp.get("description", "")).lower()
 
-        if must_have and not any(kw in text for kw in must_have):
-            continue
         if any(kw in text for kw in excluded):
+            logger.info(f"  Dropped (excluded keyword match): {opp.get('title', '')[:50]}")
             continue
 
+        failed_category = next(
+            (
+                category
+                for category, kws in required_categories.items()
+                if not any(kw in text for kw in kws)
+            ),
+            None,
+        )
+        if failed_category:
+            logger.info(
+                f"  Dropped (no match in required category '{failed_category}'): "
+                f"{opp.get('title', '')[:50]}"
+            )
+            continue
+
+        optional_matches = sum(1 for kw in optional_keywords if kw in text)
+        opp["keyword_score"] = (
+            round(optional_matches / len(optional_keywords), 2) if optional_keywords else 0.0
+        )
         passed.append(opp)
 
     logger.info(f"Keyword filter: {len(passed)} passed, {len(opportunities) - len(passed)} filtered out")
@@ -392,6 +419,8 @@ def llm_evaluate(opportunities: list[dict], config: dict) -> list[dict]:
 _DATE_FORMATS = [
     "%Y-%m-%d",
     "%m/%d/%Y",
+    "%m/%d/%y",
+    "%m/%d/%Y %I:%M %p",
     "%d/%m/%Y",
     "%B %d, %Y",
     "%b %d, %Y",
@@ -762,6 +791,12 @@ if __name__ == "__main__":
     # Bootstrap logging before config is available
     setup_logging()
 
+    load_dotenv()
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and fill in your key."
+        )
+
     config = load_config("config.json")
 
     # Re-initialise logging with values from config
@@ -771,4 +806,7 @@ if __name__ == "__main__":
         log_file=log_cfg.get("file", "agent.log"),
     )
 
-    start_scheduler(config)
+    if config.get("scheduler", {}).get("enabled", False):
+        start_scheduler(config)
+    else:
+        run_pipeline(config)

@@ -2,35 +2,55 @@
   "keywords": {
     "required": {
       "certification&security": [
-        "HIPAA-compliant data environment", 
-        "Secure Azure-hosted infrastructure", 
+        "HIPAA-compliant data environment",
+        "Secure Azure-hosted infrastructure",
         "Data security/privacy compliance",
-        "Secure data hub"
+        "Secure data hub",
+        "HIPAA",
+        "data security",
+        "data privacy",
+        "confidentiality",
+        "PHI",
+        "data protection"
       ],
       "geographic_scope":[
-        "Western New York", 
-        "Buffalo New York", 
-        "Upstate New York", 
-        "New Jersey", 
-        "Monmouth County New Jersey", 
-        "Chicago Illinois", 
-        "Cook County Illinois", 
-        "West Virginia", 
-        "National expansion", 
-        "Nationwide coverage", 
-        "All 50 states", 
-        "Multi-state deployment", 
-        "National scalability", 
-        "Every US ZIP code", 
-        "Cross-jurisdictional data sharing", 
-        "Federal-level data compliance"
+        "Western New York",
+        "Buffalo New York",
+        "Upstate New York",
+        "New Jersey",
+        "Monmouth County New Jersey",
+        "Chicago Illinois",
+        "Cook County Illinois",
+        "West Virginia",
+        "National expansion",
+        "Nationwide coverage",
+        "All 50 states",
+        "Multi-state deployment",
+        "National scalability",
+        "Every US ZIP code",
+        "Cross-jurisdictional data sharing",
+        "Federal-level data compliance",
+        "Buffalo",
+        "New York",
+        "Erie County",
+        "Niagara",
+        "Chautauqua",
+        "Cattaraugus",
+        "Chicago",
+        "Illinois",
+        "WNY"
       ],
       "core_infrastructure":[
-        "Interoperability", 
-        "Data interoperability", 
-        "Interoperable systems", 
-        "Data sharing platform", 
-        "Single source of record"
+        "Interoperability",
+        "Data interoperability",
+        "Interoperable systems",
+        "Data sharing platform",
+        "Single source of record",
+        "data sharing",
+        "data exchange",
+        "information sharing",
+        "system integration",
+        "single source of truth"
       ]
     },
 
@@ -132,10 +152,209 @@
 
   "target_agencies": [],
 
-  "state_portals": {
-    "name":"Special Supplemental Nutrition Program for Women, Infants and Children (WIC) – Training Services for the Bureau of Supplemental Food Programs",
-    "url":"https://www.health.ny.gov/funding/rfp/c042783/",
-    "type": "web",
+  "company_profile": {
+    "name": "wellConnected",
+    "platform": "allco",
+    "mission": "allco is a HIPAA-compliant data-sharing platform built by wellConnected that connects healthcare organizations and community-based organizations (CBOs) so patients can be referred for services (e.g. food pantries, housing, mental health) and have their data follow them between providers without re-entering it. allco focuses on closed-loop referrals, cross-organization collaboration, and social determinants of health (SDOH) outcomes for underserved communities."
+  },
+
+  "evaluation": {
+    "llm_model": "claude-sonnet-4-6",
+    "min_relevance_score": 5,
+    "min_days_until_deadline": 7,
+    "max_days_until_deadline": 365,
+    "flag_sole_source": true,
+    "evaluation_prompt_template": "You are evaluating an RFP/grant opportunity for {name}, the company behind {platform}.\n\nCompany profile:\n{mission}\n\nKeyword match score (0-1, higher = more keyword overlap with our focus areas): {keyword_score}\n\nOpportunity:\nTitle: {title}\nAgency/Funder: {agency_or_funder}\nDeadline: {deadline}\nEstimated Value: {estimated_value}\nDescription: {description}\n\nEvaluate how well this opportunity fits {name} and {platform}. Respond with ONLY a JSON code block of the form:\n```json\n{{\n  \"relevance_score\": <integer 1-10>,\n  \"summary\": \"<1-2 sentence overview of why this is or isn't a good fit>\",\n  \"red_flags\": [\"<any concerns, e.g. sole-source, mismatched scope, unclear budget>\"],\n  \"win_likelihood\": \"low|medium|high\"\n}}\n```"
+  },
+
+  "output": {
+    "database": {
+      "path": "opportunities.db"
+    },
+    "report": {
+      "output_path": "reports/",
+      "max_opportunities_per_report": 50
+    }
+  },
+
+  "notifications": {
     "enabled": false
-  }
+  },
+
+  "logging": {
+    "level": "INFO",
+    "file": "agent.log"
+  },
+
+  "scheduler": {
+    "enabled": false,
+    "daily_run_time": "08:00",
+    "run_on_startup": true
+  },
+
+  "scraping_sources": [
+    {
+      "name":"Special Supplemental Nutrition Program for Women, Infants and Children (WIC) – Training Services for the Bureau of Supplemental Food Programs",
+      "url":"https://www.health.ny.gov/funding/rfp/c042783/",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"WNYICC Main Site",
+      "url":"https://wnyicc.org",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"WNYICC Contact Page",
+      "url":"https://wnyicc.org/Contact",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"WNY Social Care Network Portal",
+      "url":"https://wnyscn.org",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"City of Buffalo - All Current Bids & RFPs",
+      "url":"https://www.buffalony.gov/Bids.aspx",
+      "type": "web",
+      "enabled": true,
+      "selectors": {
+        "listing": ".listItemsRow",
+        "title": ".bidTitle a",
+        "link": ".bidTitle a",
+        "deadline": ".bidStatus > div:nth-of-type(2) > span:nth-of-type(2)"
+      }
+    },
+    {
+      "name":"City of Buffalo - Financial Empowerment Center RFP Announcement",
+      "url":"https://www.buffalony.gov/CivicAlerts.aspx?aid=1584",
+      "type": "web",
+      "enabled": true,
+      "selectors": {
+        "listing": "main#main-wrapper",
+        "title": ".article-header-title",
+        "description": ".article-content"
+      }
+    },
+    {
+      "name":"Erie County Purchasing / Active RFPs",
+      "url":"https://www2.erie.gov/purchasing/requests-proposals-construction-bids",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"Erie County Department of Health",
+      "url":"https://www2.erie.gov/health",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"Erie County Community Health Assessment 2025-2030",
+      "url":"https://www2.erie.gov/health/community-health-assessment",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"Erie County Health Equity Office",
+      "url":"https://www2.erie.gov/health/health-equity",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"NYS Social Care Network Program",
+      "url":"https://www.health.ny.gov/scn",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"NYS Dept of Health - All Funding RFPs",
+      "url":"https://www.health.ny.gov/funding/rfp",
+      "type": "web",
+      "enabled": true,
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+      },
+      "selectors": {
+        "listing": "table.alt_row tbody tr",
+        "title": "td:nth-of-type(1) a",
+        "link": "td:nth-of-type(1) a",
+        "deadline": "td:nth-of-type(2)"
+      }
+    },
+    {
+      "name":"NYS Office of Mental Health RFPs",
+      "url":"https://omh.ny.gov/omhweb/rfp",
+      "type": "web",
+      "enabled": true,
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+      },
+      "selectors": {
+        "listing": "table tbody tr",
+        "title": "td:nth-of-type(1) a",
+        "link": "td:nth-of-type(1) a",
+        "deadline": "td:nth-of-type(2)"
+      }
+    },
+    {
+      "name":"OMH Upcoming Procurements (WNY included)",
+      "url":"https://omh.ny.gov/omhweb/rfp/upcoming-procurement-opportunities.html",
+      "type": "web",
+      "enabled": true,
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+      },
+      "selectors": {
+        "listing": ".col-md-9 li",
+        "title": "a",
+        "link": "a"
+      }
+    },
+    {
+      "name":"NYS Contract Reporter",
+      "url":"https://www.nyscr.ny.gov",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"NYS Grants Gateway",
+      "url":"https://grantsgateway.ny.gov",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"NYS Dept of Health - Social Care Initiatives (SDOH)",
+      "url":"https://www.health.ny.gov/health_care/medicaid/redesign/sdh",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"Community Foundation for Greater Buffalo",
+      "url":"https://www.cfgb.org",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"Instrumentl - Buffalo Nonprofit Grants Database",
+      "url":"https://www.instrumentl.com/browse-grants/buffalo-ny",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"Instrumentl - Buffalo Community Services Grants",
+      "url":"https://www.instrumentl.com/browse-grants/buffalo-ny/community-services-grants-for-nonprofits",
+      "type": "web",
+      "enabled": false
+    },
+    {
+      "name":"WNY Regional Economic Development Council",
+      "url":"https://regionalcouncils.ny.gov/western-new-york",
+      "type": "web",
+      "enabled": false
+    }
+  ]
 }
