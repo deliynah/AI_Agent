@@ -261,47 +261,47 @@ def keyword_filter(opportunities: list[dict], config: dict) -> list[dict]:
     logger.info("=== STAGE: KEYWORD FILTER ===")
 
     keywords = config.get("keywords", {})
-    required_categories = {
-        category: [kw.lower() for kw in kws]
-        for category, kws in keywords.get("required", {}).items()
+    required = {
+        cat: [kw.lower() for kw in kws]
+        for cat, kws in keywords.get("required", {}).items()
     }
-    optional_keywords = [
-        kw.lower()
-        for kws in keywords.get("optional", {}).values()
-        for kw in kws
-    ]
+    optional = {
+        cat: [kw.lower() for kw in kws]
+        for cat, kws in keywords.get("optional", {}).items()
+    }
     excluded = [kw.lower() for kw in keywords.get("excluded", [])]
 
     passed: list[dict] = []
     for opp in opportunities:
         text = (opp.get("title", "") + " " + opp.get("description", "")).lower()
 
-        if any(kw in text for kw in excluded):
-            logger.info(f"  Dropped (excluded keyword match): {opp.get('title', '')[:50]}")
+        triggered = next((kw for kw in excluded if kw in text), None)
+        if triggered:
+            logger.info(f"  Dropped (excluded keyword '{triggered}'): {opp.get('title', '')[:50]}")
             continue
 
-        failed_category = next(
-            (
-                category
-                for category, kws in required_categories.items()
-                if not any(kw in text for kw in kws)
-            ),
-            None,
-        )
-        if failed_category:
-            logger.info(
-                f"  Dropped (no match in required category '{failed_category}'): "
-                f"{opp.get('title', '')[:50]}"
-            )
-            continue
+        required_matches = {
+            cat: {kw: (kw in text) for kw in kws}
+            for cat, kws in required.items()
+        }
+        required_matched = sum(hit for m in required_matches.values() for hit in m.values())
+        required_total = sum(len(kws) for kws in required.values())
 
-        optional_matches = sum(1 for kw in optional_keywords if kw in text)
-        opp["keyword_score"] = (
-            round(optional_matches / len(optional_keywords), 2) if optional_keywords else 0.0
-        )
+        optional_matched = sum(1 for kws in optional.values() for kw in kws if kw in text)
+        optional_total = sum(len(kws) for kws in optional.values())
+
+        total = required_total + optional_total
+        opp["keyword_matches"] = required_matches
+        opp["keyword_score"] = round((required_matched + optional_matched) / total, 3) if total else 0.0
+        opp["optional_keyword_count"] = optional_matched
+        opp["optional_keyword_total"] = optional_total
         passed.append(opp)
 
-    logger.info(f"Keyword filter: {len(passed)} passed, {len(opportunities) - len(passed)} filtered out")
+    passed.sort(key=lambda x: x.get("keyword_score", 0), reverse=True)
+    logger.info(
+        f"Keyword filter: {len(passed)} passed (excluded {len(opportunities) - len(passed)}), "
+        f"sorted by keyword_score descending"
+    )
     return passed
 
 
@@ -309,9 +309,24 @@ def keyword_filter(opportunities: list[dict], config: dict) -> list[dict]:
 # 4. LLM EVALUATOR
 # ──────────────────────────────────────────────────────────────
 
+def _format_keyword_matches_summary(opportunity: dict) -> str:
+    lines = []
+    for cat, matches in opportunity.get("keyword_matches", {}).items():
+        found = [kw for kw, hit in matches.items() if hit]
+        lines.append(f"  {cat}: {len(found)}/{len(matches)} matched — {', '.join(found) or 'none'}")
+    opt_count = opportunity.get("optional_keyword_count", 0)
+    opt_total = opportunity.get("optional_keyword_total", 0)
+    if opt_total:
+        lines.append(f"  optional keywords: {opt_count}/{opt_total} matched")
+    return "\n".join(lines) if lines else "no keyword data"
+
+
 def _build_evaluation_prompt(template: str, company_profile: dict, opportunity: dict) -> str:
-    context = {**company_profile, **opportunity}
+    keyword_matches_summary = _format_keyword_matches_summary(opportunity)
+    context = {**company_profile, **opportunity, "keyword_matches_summary": keyword_matches_summary}
     for key, value in context.items():
+        if not isinstance(value, (str, int, float, bool, type(None))):
+            continue
         template = template.replace(f"{{{key}}}", str(value))
     return template
 
@@ -641,6 +656,13 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     .view-link { display:inline-block; margin-top:10px; color:#2e86de; font-size:0.9em; text-decoration:none; }
     .view-link:hover { text-decoration:underline; }
     .no-results { text-align:center; padding:60px 20px; color:#999; font-size:1.1em; }
+    .kw-checklist { margin:10px 0; padding:10px 14px; background:#f9fbfd; border-radius:6px; border:1px solid #e8edf2; }
+    .kw-cat-row { display:flex; align-items:flex-start; gap:10px; margin:4px 0; flex-wrap:wrap; }
+    .kw-cat-label { font-size:0.77em; font-weight:bold; color:#666; min-width:175px; flex-shrink:0; padding-top:3px; text-transform:uppercase; letter-spacing:0.03em; }
+    .kw-chips { display:flex; flex-wrap:wrap; gap:4px; }
+    .kw-hit { background:#d5f5e3; color:#1a6b3a; padding:1px 7px; border-radius:4px; font-size:0.75em; }
+    .kw-miss { background:#f0f0f0; color:#bbb; padding:1px 7px; border-radius:4px; font-size:0.75em; }
+    .kw-footer { font-size:0.8em; color:#999; margin:6px 0 0; }
   </style>
 </head>
 <body>
@@ -680,6 +702,20 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
         <span class="sole-source">⚠ Sole Source</span>
         {% endif %}
       </div>
+
+      {% if opp.keyword_matches %}
+      <div class="kw-checklist">
+        {% for cat, matches in opp.keyword_matches.items() %}
+        <div class="kw-cat-row">
+          <span class="kw-cat-label">{{ cat }}</span>
+          <div class="kw-chips">
+            {% for kw, hit in matches.items() %}<span class="{{ 'kw-hit' if hit else 'kw-miss' }}">{{ kw }}</span>{% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+        <p class="kw-footer">Optional: {{ opp.optional_keyword_count | default(0) }}/{{ opp.optional_keyword_total | default(0) }} matched &nbsp;&middot;&nbsp; Score: {{ opp.keyword_score | default(0) }}</p>
+      </div>
+      {% endif %}
 
       {% if opp.summary %}
       <p class="summary">{{ opp.summary }}</p>
@@ -788,92 +824,104 @@ _DEBUG_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RFP Rejection Debugger</title>
+  <title>RFP Keyword Scorer — Debug View</title>
   <style>
-    {% macro bcls(cat) %}{% if 'cert' in cat %}badge-cert{% elif 'geo' in cat %}badge-geo{% elif 'core' in cat %}badge-core{% else %}badge-excl{% endif %}{% endmacro %}
     * { box-sizing: border-box; }
     body { font-family: Arial, sans-serif; background: #fff; color: #222; max-width: 1500px; margin: 0 auto; padding: 32px 24px; }
-    h1 { color: #1a2638; border-bottom: 3px solid #e74c3c; padding-bottom: 10px; margin-bottom: 6px; }
+    h1 { color: #1a2638; border-bottom: 3px solid #2e86de; padding-bottom: 10px; margin-bottom: 6px; }
     h2 { color: #1a2638; font-size: 1.1em; margin: 28px 0 12px; }
     .subtitle { color: #666; font-size: 0.9em; margin-bottom: 32px; }
-    .summary-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 32px; }
+    .summary-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 36px; }
     .stat { background: #f4f6f8; border-radius: 8px; padding: 16px 24px; text-align: center; min-width: 150px; }
     .stat .num { font-size: 2.2em; font-weight: bold; color: #1a2638; line-height: 1.1; }
     .stat .lbl { font-size: 0.8em; color: #666; margin-top: 4px; }
-    .breakdown-grid { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 36px; }
-    .bk-card { background: #f9f9f9; border-radius: 8px; padding: 12px 20px; display: flex; align-items: center; gap: 14px; }
-    .bk-card .bk-count { font-size: 1.6em; font-weight: bold; color: #1a2638; }
-    .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.82em; font-weight: bold; white-space: nowrap; }
-    .badge-cert { background: #fde8e8; color: #c0392b; }
-    .badge-geo  { background: #fff3cd; color: #856404; }
-    .badge-core { background: #dbeafe; color: #1e40af; }
-    .badge-excl { background: #f3e8ff; color: #6d28d9; }
+    .excl-table { width: 100%; border-collapse: collapse; font-size: 0.85em; margin-bottom: 36px; }
+    .excl-table th { background: #c0392b; color: #fff; padding: 8px 12px; text-align: left; }
+    .excl-table td { padding: 7px 12px; border-bottom: 1px solid #eee; }
+    .excl-table tr:nth-child(even) { background: #fdf5f5; }
     .table-wrap { overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.84em; }
     thead th { background: #1a2638; color: #fff; padding: 10px 14px; text-align: left; white-space: nowrap; }
     tbody tr:nth-child(even) { background: #fafafa; }
     tbody tr:hover { background: #f0f5ff; }
     td { padding: 9px 14px; vertical-align: top; border-bottom: 1px solid #eee; }
+    .score-cell { font-weight: bold; font-size: 1.05em; white-space: nowrap; }
+    .score-hi { color: #1a6b3a; }
+    .score-mid { color: #856404; }
+    .score-lo { color: #aaa; }
     .title-cell { font-weight: 600; max-width: 220px; word-break: break-word; }
-    .url-cell { max-width: 160px; word-break: break-all; font-size: 0.8em; }
-    .kw-cell { max-width: 280px; }
-    .snippet-cell { max-width: 360px; font-size: 0.82em; color: #444; line-height: 1.5; word-break: break-word; }
-    .kw-list { display: flex; flex-wrap: wrap; gap: 4px; }
-    .kw-tag { background: #eef0f2; border-radius: 4px; padding: 2px 7px; font-size: 0.78em; color: #555; }
-    .kw-tag.hit { background: #fde8e8; color: #c0392b; font-weight: bold; }
+    .url-cell { max-width: 140px; word-break: break-all; font-size: 0.8em; }
+    .kw-section { }
+    .kw-cat-row { display: flex; align-items: flex-start; gap: 8px; margin: 3px 0; flex-wrap: wrap; }
+    .kw-cat-label { font-size: 0.72em; font-weight: bold; color: #777; min-width: 160px; flex-shrink: 0; padding-top: 2px; text-transform: uppercase; letter-spacing: 0.03em; }
+    .kw-chips { display: flex; flex-wrap: wrap; gap: 3px; }
+    .kw-hit { background: #d5f5e3; color: #1a6b3a; padding: 1px 6px; border-radius: 4px; font-size: 0.74em; }
+    .kw-miss { background: #f0f0f0; color: #bbb; padding: 1px 6px; border-radius: 4px; font-size: 0.74em; }
+    .opt-line { font-size: 0.78em; color: #999; margin-top: 4px; }
     a { color: #2e86de; text-decoration: none; }
     a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
-{% macro bcls(cat) %}{% if 'cert' in cat %}badge-cert{% elif 'geo' in cat %}badge-geo{% elif 'core' in cat %}badge-core{% else %}badge-excl{% endif %}{% endmacro %}
-  <h1>RFP Rejection Debugger</h1>
-  <p class="subtitle">Generated: <strong>{{ report_date }}</strong> &nbsp;&middot;&nbsp; Shows exactly why each RFP failed the keyword filter &mdash; use this to tune config.json</p>
+  <h1>RFP Keyword Scorer — Debug View</h1>
+  <p class="subtitle">Generated: <strong>{{ report_date }}</strong> &nbsp;&middot;&nbsp; All non-excluded RFPs ranked by keyword score. Use this to tune keywords in config.json.</p>
 
   <div class="summary-row">
     <div class="stat"><div class="num">{{ total_scraped }}</div><div class="lbl">Total Scraped</div></div>
-    <div class="stat"><div class="num">{{ total_rejected }}</div><div class="lbl">Rejected by Filter</div></div>
-    <div class="stat"><div class="num">{{ total_passed }}</div><div class="lbl">Passed Filter</div></div>
+    <div class="stat"><div class="num">{{ excluded_count }}</div><div class="lbl">Excluded (hard reject)</div></div>
+    <div class="stat"><div class="num">{{ scored_count }}</div><div class="lbl">Scored &amp; Ranked</div></div>
   </div>
 
-  <h2>Failure Breakdown by Category</h2>
-  <div class="breakdown-grid">
-    {% for cat, count in breakdown.items() %}
-    <div class="bk-card">
-      <div class="bk-count">{{ count }}</div>
-      <span class="badge {{ bcls(cat) }}">{{ cat }}</span>
-    </div>
-    {% endfor %}
-  </div>
+  {% if excluded %}
+  <h2>Excluded by Keyword ({{ excluded | length }})</h2>
+  <table class="excl-table">
+    <thead><tr><th>#</th><th>Title</th><th>Triggered Keyword</th><th>URL</th></tr></thead>
+    <tbody>
+      {% for r in excluded %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td>{{ r.title or "(no title)" }}</td>
+        <td><strong>{{ r.triggered_keyword }}</strong></td>
+        <td><a href="{{ r.url }}" target="_blank" rel="noopener">{{ r.url[:60] }}{% if r.url | length > 60 %}&hellip;{% endif %}</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
 
-  <h2>All Rejections ({{ total_rejected }})</h2>
+  <h2>Scored &amp; Ranked ({{ scored | length }}) — highest keyword overlap first</h2>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
-          <th>#</th>
+          <th>Rank</th>
+          <th>Score</th>
           <th>Title</th>
           <th>URL</th>
-          <th>Failed Category</th>
-          <th>Keywords Checked</th>
-          <th>Text Searched</th>
+          <th>Keyword Matches by Category</th>
         </tr>
       </thead>
       <tbody>
-        {% for r in rejections %}
+        {% for opp in scored %}
+        {% set s = opp.keyword_score | default(0) %}
         <tr>
           <td>{{ loop.index }}</td>
-          <td class="title-cell">{{ r.title or "(no title)" }}</td>
-          <td class="url-cell">
-            {% if r.url %}<a href="{{ r.url }}" target="_blank" rel="noopener">{{ r.url[:55] }}{% if r.url | length > 55 %}&hellip;{% endif %}</a>{% else %}&mdash;{% endif %}
-          </td>
-          <td><span class="badge {{ bcls(r.failed_category) }}">{{ r.failed_category }}</span></td>
-          <td class="kw-cell">
-            <div class="kw-list">
-              {% for kw in r.keywords_checked %}<span class="kw-tag{% if r.triggered_keyword == kw %} hit{% endif %}">{{ kw }}</span>{% endfor %}
+          <td class="score-cell {{ 'score-hi' if s >= 0.1 else ('score-mid' if s >= 0.03 else 'score-lo') }}">{{ "%.3f"|format(s) }}</td>
+          <td class="title-cell">{{ opp.title or "(no title)" }}</td>
+          <td class="url-cell">{% if opp.source_url %}<a href="{{ opp.source_url }}" target="_blank" rel="noopener">{{ opp.source_url[:55] }}{% if opp.source_url | length > 55 %}&hellip;{% endif %}</a>{% else %}&mdash;{% endif %}</td>
+          <td>
+            <div class="kw-section">
+              {% for cat, matches in opp.keyword_matches.items() %}
+              <div class="kw-cat-row">
+                <span class="kw-cat-label">{{ cat }}</span>
+                <div class="kw-chips">
+                  {% for kw, hit in matches.items() %}<span class="{{ 'kw-hit' if hit else 'kw-miss' }}">{{ kw }}</span>{% endfor %}
+                </div>
+              </div>
+              {% endfor %}
+              <p class="opt-line">Optional: {{ opp.optional_keyword_count | default(0) }}/{{ opp.optional_keyword_total | default(0) }} matched</p>
             </div>
           </td>
-          <td class="snippet-cell">{{ r.text_snippet or "(empty)" }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -883,87 +931,49 @@ _DEBUG_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
-def debug_keyword_filter(opportunities: list[dict], config: dict) -> tuple[list[dict], list[dict]]:
-    keywords = config.get("keywords", {})
-    required_categories = {
-        category: [kw.lower() for kw in kws]
-        for category, kws in keywords.get("required", {}).items()
-    }
-    optional_keywords = [
-        kw.lower()
-        for kws in keywords.get("optional", {}).values()
-        for kw in kws
-    ]
-    excluded = [kw.lower() for kw in keywords.get("excluded", [])]
-
-    passed: list[dict] = []
-    rejections: list[dict] = []
-
-    for opp in opportunities:
-        raw_text = opp.get("title", "") + " " + opp.get("description", "")
-        text = raw_text.lower()
-        snippet = raw_text[:400].strip()
-
-        triggered_excl = next((kw for kw in excluded if kw in text), None)
-        if triggered_excl:
-            rejections.append({
-                "title": opp.get("title", ""),
-                "url": opp.get("source_url", ""),
-                "failed_category": "excluded",
-                "keywords_checked": excluded,
-                "triggered_keyword": triggered_excl,
-                "text_snippet": snippet,
-            })
-            continue
-
-        rejected = False
-        for category, kws in required_categories.items():
-            if not any(kw in text for kw in kws):
-                rejections.append({
-                    "title": opp.get("title", ""),
-                    "url": opp.get("source_url", ""),
-                    "failed_category": category,
-                    "keywords_checked": kws,
-                    "triggered_keyword": None,
-                    "text_snippet": snippet,
-                })
-                rejected = True
-                break
-
-        if not rejected:
-            optional_matches = sum(1 for kw in optional_keywords if kw in text)
-            opp["keyword_score"] = round(optional_matches / len(optional_keywords), 2) if optional_keywords else 0.0
-            passed.append(opp)
-
-    return passed, rejections
-
-
-def generate_debug_report(total_scraped: int, rejections: list[dict]) -> str:
-    breakdown = dict(Counter(r["failed_category"] for r in rejections))
+def generate_debug_report(total_scraped: int, scored: list[dict], excluded: list[dict]) -> str:
     report_date = datetime.now().strftime("%Y-%m-%d %H:%M")
     filepath = "rejection_debug.html"
 
     html = Template(_DEBUG_TEMPLATE).render(
         report_date=report_date,
         total_scraped=total_scraped,
-        total_rejected=len(rejections),
-        total_passed=total_scraped - len(rejections),
-        breakdown=breakdown,
-        rejections=rejections,
+        excluded_count=len(excluded),
+        scored_count=len(scored),
+        excluded=excluded,
+        scored=scored,
     )
 
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(html)
 
-    logger.info(f"Debug report saved: {filepath} ({len(rejections)}/{total_scraped} rejections)")
+    logger.info(f"Debug report saved: {filepath} ({len(excluded)} excluded, {len(scored)} scored)")
     return filepath
 
 
 def run_debug(config: dict) -> None:
-    logger.info("=== REJECTION DEBUGGER ===")
+    logger.info("=== KEYWORD SCORER DEBUG ===")
     raw = scrape_all(config)
-    _, rejections = debug_keyword_filter(raw, config)
-    filepath = generate_debug_report(len(raw), rejections)
+
+    keywords = config.get("keywords", {})
+    excluded_kws = [kw.lower() for kw in keywords.get("excluded", [])]
+
+    excluded_records = []
+    to_score = []
+    for opp in raw:
+        text = (opp.get("title", "") + " " + opp.get("description", "")).lower()
+        triggered = next((kw for kw in excluded_kws if kw in text), None)
+        if triggered:
+            excluded_records.append({
+                "title": opp.get("title", ""),
+                "url": opp.get("source_url", ""),
+                "triggered_keyword": triggered,
+            })
+        else:
+            to_score.append(opp)
+
+    scored = keyword_filter(to_score, config)
+    filepath = generate_debug_report(len(raw), scored, excluded_records)
     webbrowser.open(Path(filepath).resolve().as_uri())
 
 

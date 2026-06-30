@@ -90,9 +90,8 @@ New logic:
   `summary`, `red_flags`, `win_likelihood`).
 - **2.2** Fold `keyword_score` from Phase 1 into the prompt as a signal. Default model:
   `claude-sonnet-4-6` (or `claude-opus-4-8` for higher-quality judgment at higher cost).
-- **2.3** ✅ DONE — Claude tool-use for deterministic JSON parsing. Added `_EVALUATION_TOOL`
-  schema to `main.py` and switched `llm_evaluate` to `tool_choice={"type":"tool","name":"evaluate_opportunity"}`.
-  Claude is now forced to return a typed struct; `_parse_llm_response` remains as a text fallback only.
+- **2.3** (Optional hardening) Use Claude tool-use / structured output for deterministic
+  JSON parsing.
 
   -personal notes: 
     -instructions Claude recieves when judging whether grant is good fit fore wellconnected
@@ -110,28 +109,14 @@ New logic:
       - stores in a .env + .gitignore means it stays on local machine only, so if you were to push main.py code into GitHub nobody would be able to see these authentications 
     -3.3: main.py currently does not run correctly so it calude will fix that, run_pipeline never is called 
 
-### Phase 4 — Source-specific scraping ✅ DONE
+### Phase 4 — Source-specific scraping (follow-up)
+- Enabled sources (Buffalo Bids `.aspx`, Buffalo CivicAlerts, NYS DOH RFP index) are HTML
+  pages; `scrape_web` needs per-site CSS `selectors` blocks. The generic `article`
+  selector won't match these portals. yap yap yap 
+- May require live-page inspection to tune selectors.
+- Optionally add an LLM-extraction fallback for unstructured pages.
 
-Live inspection results (fetched all enabled sources with requests + BeautifulSoup):
-
-| Source | Status | Selectors |
-|---|---|---|
-| City of Buffalo Bids `.aspx` | ✅ working — 10 bids | `.listItemsRow` / `.bidTitle a` / `.bidStatus > div:nth-of-type(2) > span:nth-of-type(2)` |
-| Buffalo CivicAlerts | ✅ working — 1 article | `main#main-wrapper` / `.article-header-title` / `.article-content` |
-| NYS DOH RFP index | ✅ working — 23 RFPs | `table.alt_row tbody tr` / `td:nth-of-type(1) a` / `td:nth-of-type(2)` |
-| **NYS OMH RFPs** (newly enabled) | ✅ 140 RFPs | `table tbody tr` / `td:nth-of-type(1) a` / `td:nth-of-type(2)` |
-| **OMH Upcoming Procurements** (newly enabled) | ✅ 38 listings | `.col-md-9 li` / `a` / `a` |
-| Erie County Purchasing | ❌ 404 — URL dead, left disabled | — |
-
-**Total pipeline input: 212 raw opportunities from 5 live sources.**
-
-Also fixed in `main.py` `_DATE_FORMATS`:
-- Added `%m/%d/%y` → handles OMH format `"8/13/26"` (2-digit year)
-- Added `%m/%d/%Y %I:%M %p` → handles Buffalo Bids format `"6/30/2026 4:00 PM"`
-
-Note on the keyword filter: RFP listing pages only expose titles + deadlines (no body text), so all three required AND-gates must fire on the title alone. Opportunities that pass will be ones that explicitly name HIPAA/data sharing/geographic scope in their title — this is high-precision by design.
-
-- personal notes: sites have different HTML structure, this phase inspected each live site to figure out which CSS classes/elements contain opportunity listings
+- personal notes: sites have different HTML strucutre, this phase will insepct each live site to figure out which CSS classes/elemnts contain oppurnuity listings 
 ---
 
 ## Drafted Keyword Additions (Phase 1.2, pending approval)
@@ -140,6 +125,24 @@ The matcher does a simple `keyword.lower() in text` substring check, and most cu
 required terms are long exact phrases an RFP will never contain verbatim. For the strict
 AND-gate to ever pass, each required category needs short, real-world tokens (all existing
 phrases are kept).
+-Personal notes: 
+  -check for case-sensitivity 
+  -phase 1.2 adds a safety check that if too many required category failed to match then it logs that the keywords in the category need more short/realstic token added 
+
+
+## Additional features 
+Feature Request: Keyword Filter Drop-Rate Alert
+When the keyword filter runs, track how many opportunities are evaluated versus how many are rejected. If the rejection rate exceeds a set threshold (for example, 90% or more of all scraped opportunities are dropped in a single pipeline run), automatically send a notification to the developer/user.
+The notification should include:
+
+The total number of opportunities scraped
+The total number rejected by the keyword filter
+The rejection rate as a percentage
+A breakdown of which required keyword categories were responsible for the most drops (e.g. certification&security failed 45 times, geographic_scope failed 12 times)
+A warning message saying something like: "High rejection rate detected — the keyword filter may be too strict. Consider reviewing and expanding the keyword list in config.json."
+
+This notification should be delivered through the existing notifications system already planned in Phase 1.3, using whatever channel is configured (email, Slack, etc.).
+The threshold for triggering the alert (e.g. 90%) should be a configurable value in config.json under the notifications section so it can be adjusted without touching the code.
 
 ### `certification&security` (hardest gate — currently 0 single tokens)
 `HIPAA`, `data security`, `data privacy`, `confidentiality`, `PHI`, `data protection`
@@ -156,25 +159,26 @@ phrases are kept).
 
 ## Execution Order
 
-1. Phase 1.1 (✅ done) → 1.3 (✅ done) → 1.2 (✅ done)
-2. Phase 3 (✅ done) → Phase 2 (✅ done) → Phase 4 (✅ done)
-
-All phases complete. Next steps: end-to-end test with a real `ANTHROPIC_API_KEY`.
+1. Phase 1.1 (✅ done) → 1.3 (config sections) → 1.2 (filter rewrite + keyword additions)
+2. Phase 3 (so it can call the API) → smoke-test end-to-end
+3. Phase 2 (prompt quality) → Phase 4 (real scraping selectors)
 
 ## Open Decisions
 
-1. ✅ Keyword list approved and merged into config.json.
-2. ✅ Keeping strict 3-category AND (including `certification&security`).
+1. Approve the drafted keyword list as-is, or edit it.
+2. Keep strict 3-category AND, or soften `certification&security` to scored-only.
 
-## Phase 5 — End-to-end test & ongoing source expansion (next steps)
 
-- Set `ANTHROPIC_API_KEY` in `.env` and run `python main.py` for a real pipeline run.
-- Inspect `agent.log` and the generated `reports/*.html` to verify LLM scores + HTML output.
-- If 0 opportunities survive the keyword filter consistently, consider scraping individual
-  RFP detail pages (follow links from listing pages) to get full body text — this gives the
-  security/data-sharing keywords a chance to appear.
-- Potential sources still to add selectors for (all currently disabled):
-  - **NYS Contract Reporter** (nyscr.ny.gov) — requires account/navigation, skip for now
-  - **Community Foundation for Greater Buffalo** (cfgb.org) — inspect for grant deadlines page
-  - **Erie County Purchasing** — URL is 404; find updated URL
-  - **NYS Grants Gateway** — login-walled, skip
+### Phase 5 — Replace Hard Keyword Gate with Scored Priority System ✅ DONE
+
+**What changed:**
+- `keyword_filter()` rewritten: removed the AND-gate logic that dropped RFPs failing any required category. Only excluded keywords still cause hard rejection.
+- Every non-excluded RFP now passes to the LLM, scored and sorted by `keyword_score`.
+- `keyword_matches` dict built per-RFP: per required category, records exactly which keywords were found (True/False checklist).
+- `keyword_score` = (required_matched + optional_matched) / total_keywords — 0–1 float.
+- RFPs sorted by `keyword_score` descending before entering LLM evaluation.
+- `keyword_matches_summary` injected into the LLM prompt so Claude sees which terms matched.
+- HTML report now shows a keyword checklist per card (green chips = matched, gray = not matched) and optional keyword summary.
+- `--debug` report updated: now shows all 212 RFPs ranked by score with their full keyword checklist, instead of the old rejection list.
+
+**Result:** 212 RFPs now reach the LLM (previously 0). The most keyword-aligned opportunities are evaluated first.
