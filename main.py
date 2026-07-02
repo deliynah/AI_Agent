@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 import webbrowser
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -19,6 +20,8 @@ from urllib.parse import urljoin
 
 import anthropic
 import requests
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+from anthropic.types.messages.batch_create_params import Request as BatchRequest
 from apscheduler.schedulers.blocking import BlockingScheduler
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -434,6 +437,31 @@ def _parse_llm_response(text: str) -> dict:
     return result
 
 
+_DEFAULT_RUBRIC_WEIGHTS = {
+    "keyword_score": 0.45,
+    "relevance_score": 0.35,
+    "mission_alignment_score": 0.2,
+}
+
+
+def _compute_composite_score(opp: dict, weights: dict) -> float:
+    """Blend the deterministic keyword_score (Phase 5) with the LLM-derived
+    scores into one weighted 0-100 rubric score. keyword_score is not a gate —
+    an opportunity with no keyword hits can still rank well on LLM judgment.
+    win_likelihood is intentionally excluded (Phase 8 follow-up) — it was too
+    speculative to weight alongside the other three signals."""
+    keyword_component = opp.get("keyword_score", 0.0) or 0.0
+    relevance_component = min(10, max(0, opp.get("relevance_score", 0) or 0)) / 10
+    mission_component = min(10, max(0, opp.get("mission_alignment_score", 0) or 0)) / 10
+
+    composite = (
+        weights.get("keyword_score", 0) * keyword_component
+        + weights.get("relevance_score", 0) * relevance_component
+        + weights.get("mission_alignment_score", 0) * mission_component
+    )
+    return round(composite * 100, 1)
+
+
 _EVALUATION_TOOL = {
     "name": "evaluate_opportunity",
     "description": "Return a structured evaluation of an RFP or grant opportunity.",
@@ -509,74 +537,121 @@ _EVALUATION_TOOL = {
 }
 
 
+def _extract_scores_from_message(message) -> dict:
+    """Pull the structured evaluation fields out of a completed Messages API
+    response, preferring the forced tool_use block and falling back to
+    text parsing if the model didn't return one."""
+    tool_block = next(
+        (block for block in message.content if block.type == "tool_use"),
+        None,
+    )
+    if tool_block:
+        inp = tool_block.input
+        return {
+            "relevance_score": min(10, max(1, int(inp.get("relevance_score", 0)))),
+            "summary": str(inp.get("summary", "")),
+            "red_flags": list(inp.get("red_flags", [])),
+            "win_likelihood": str(inp.get("win_likelihood", "low")).lower(),
+            "mission_alignment_score": min(10, max(1, int(inp.get("mission_alignment_score", 0)))),
+            "mission_fit_explanation": str(inp.get("mission_fit_explanation", "")),
+            "key_requirements": list(inp.get("key_requirements", [])),
+            "win_tip": str(inp.get("win_tip", "")),
+        }
+
+    response_text = next(
+        (block.text for block in message.content if hasattr(block, "text")),
+        "",
+    )
+    return _parse_llm_response(response_text)
+
+
 def llm_evaluate(opportunities: list[dict], config: dict) -> list[dict]:
-    logger.info("=== STAGE: LLM EVALUATION ===")
+    """Evaluate opportunities via the Message Batches API (Phase 9 / #1 runtime
+    fix). Batches are not subject to the standard per-minute rate limits that
+    made the concurrent ThreadPoolExecutor approach 429 — all RFPs are
+    submitted as one batch, processed server-side, and polled to completion."""
+    logger.info("=== STAGE: LLM EVALUATION (Message Batches) ===")
+
+    total = len(opportunities)
+    if total == 0:
+        logger.info("No opportunities to evaluate — skipping batch submission.")
+        return []
 
     eval_cfg = config.get("evaluation", {})
     model = eval_cfg.get("llm_model", "claude-sonnet-4-6")
     min_score = eval_cfg.get("min_relevance_score", 5)
     prompt_template = eval_cfg.get("evaluation_prompt_template", "")
     company_profile = config.get("company_profile", {})
+    rubric_weights = eval_cfg.get("rubric_weights", _DEFAULT_RUBRIC_WEIGHTS)
+    poll_interval = eval_cfg.get("batch_poll_interval_seconds", 15)
+    batch_timeout = eval_cfg.get("batch_timeout_seconds", 3600)
 
     client = anthropic.Anthropic()
-    evaluated: list[dict] = []
 
-    for i, opp in enumerate(opportunities, 1):
-        logger.info(f"Evaluating {i}/{len(opportunities)}: {opp.get('title', '')[:70]}")
-        try:
-            prompt = _build_evaluation_prompt(prompt_template, company_profile, opp)
-            if not prompt.strip():
-                prompt = (
-                    f"Evaluate this opportunity for {company_profile.get('name', 'our company')}.\n\n"
-                    f"Title: {opp.get('title', '')}\n"
-                    f"Description: {opp.get('description', '')[:1500]}"
-                )
-
-            message = client.messages.create(
+    batch_requests = []
+    for i, opp in enumerate(opportunities):
+        prompt = _build_evaluation_prompt(prompt_template, company_profile, opp)
+        if not prompt.strip():
+            prompt = (
+                f"Evaluate this opportunity for {company_profile.get('name', 'our company')}.\n\n"
+                f"Title: {opp.get('title', '')}\n"
+                f"Description: {opp.get('description', '')[:1500]}"
+            )
+        batch_requests.append(BatchRequest(
+            custom_id=f"rfp-{i}",
+            params=MessageCreateParamsNonStreaming(
                 model=model,
                 max_tokens=1024,
                 tools=[_EVALUATION_TOOL],
                 tool_choice={"type": "tool", "name": "evaluate_opportunity"},
                 messages=[{"role": "user", "content": prompt}],
+            ),
+        ))
+
+    logger.info(f"Submitting batch of {total} RFPs to the Message Batches API")
+    batch = client.messages.batches.create(requests=batch_requests)
+    logger.info(f"  Batch {batch.id} created — polling every {poll_interval}s (timeout {batch_timeout}s)")
+
+    start = time.monotonic()
+    while batch.processing_status != "ended":
+        if time.monotonic() - start > batch_timeout:
+            logger.error(
+                f"  Batch {batch.id} still '{batch.processing_status}' after {batch_timeout}s — "
+                f"collecting whatever results are ready and moving on"
             )
+            break
+        time.sleep(poll_interval)
+        batch = client.messages.batches.retrieve(batch.id)
+        counts = batch.request_counts
+        logger.info(
+            f"  Batch {batch.id}: {batch.processing_status} "
+            f"(succeeded={counts.succeeded}, errored={counts.errored}, processing={counts.processing})"
+        )
 
-            tool_block = next(
-                (block for block in message.content if block.type == "tool_use"),
-                None,
-            )
-            if tool_block:
-                inp = tool_block.input
-                scores = {
-                    "relevance_score": min(10, max(1, int(inp.get("relevance_score", 0)))),
-                    "summary": str(inp.get("summary", "")),
-                    "red_flags": list(inp.get("red_flags", [])),
-                    "win_likelihood": str(inp.get("win_likelihood", "low")).lower(),
-                    "mission_alignment_score": min(10, max(1, int(inp.get("mission_alignment_score", 0)))),
-                    "mission_fit_explanation": str(inp.get("mission_fit_explanation", "")),
-                    "key_requirements": list(inp.get("key_requirements", [])),
-                    "win_tip": str(inp.get("win_tip", "")),
-                }
-            else:
-                response_text = next(
-                    (block.text for block in message.content if hasattr(block, "text")),
-                    "",
-                )
-                scores = _parse_llm_response(response_text)
+    results_by_id = {result.custom_id: result for result in client.messages.batches.results(batch.id)}
 
-            if scores["relevance_score"] < min_score:
-                logger.info(
-                    f"  Dropped — score {scores['relevance_score']} < {min_score}: "
-                    f"{opp.get('title', '')[:50]}"
-                )
-                continue
+    evaluated: list[dict] = []
+    for i, opp in enumerate(opportunities):
+        result = results_by_id.get(f"rfp-{i}")
+        if result is None:
+            logger.error(f"  No batch result for '{opp.get('title', '')[:60]}' — dropping")
+            continue
+        if result.result.type != "succeeded":
+            logger.error(f"  Batch eval '{result.result.type}' for '{opp.get('title', '')[:60]}' — dropping")
+            continue
 
-            opp.update(scores)
-            evaluated.append(opp)
+        scores = _extract_scores_from_message(result.result.message)
+        opp.update(scores)
+        opp["composite_score"] = _compute_composite_score(opp, rubric_weights)
+        opp["meets_relevance_threshold"] = opp["relevance_score"] >= min_score
+        evaluated.append(opp)
 
-        except Exception as exc:
-            logger.error(f"LLM evaluation failed for '{opp.get('title', '')}': {exc}")
-
-    logger.info(f"LLM evaluation: {len(evaluated)}/{len(opportunities)} passed min score {min_score}")
+    passing = sum(1 for o in evaluated if o.get("meets_relevance_threshold"))
+    logger.info(
+        f"LLM evaluation: {len(evaluated)}/{total} scored "
+        f"({passing} meet the {min_score}+ relevance threshold, all {len(evaluated)} kept for ranking) "
+        f"via batch {batch.id}"
+    )
     return evaluated
 
 
@@ -671,7 +746,9 @@ CREATE TABLE IF NOT EXISTS opportunities (
     mission_alignment_score INTEGER DEFAULT 0,
     mission_fit_explanation TEXT,
     key_requirements  TEXT,
-    win_tip           TEXT
+    win_tip           TEXT,
+    keyword_score     REAL DEFAULT 0,
+    composite_score   REAL DEFAULT 0
 )
 """
 
@@ -680,8 +757,9 @@ INSERT OR IGNORE INTO opportunities
     (title, description, source_url, deadline, estimated_value,
      agency_or_funder, source_name, relevance_score, summary,
      red_flags, win_likelihood, sole_source_flag, scraped_at, status,
-     mission_alignment_score, mission_fit_explanation, key_requirements, win_tip)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     mission_alignment_score, mission_fit_explanation, key_requirements, win_tip,
+     keyword_score, composite_score)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -697,12 +775,106 @@ def _init_database(db_path: str) -> sqlite3.Connection:
         ("mission_fit_explanation", "ALTER TABLE opportunities ADD COLUMN mission_fit_explanation TEXT"),
         ("key_requirements", "ALTER TABLE opportunities ADD COLUMN key_requirements TEXT"),
         ("win_tip", "ALTER TABLE opportunities ADD COLUMN win_tip TEXT"),
+        ("keyword_score", "ALTER TABLE opportunities ADD COLUMN keyword_score REAL DEFAULT 0"),
+        ("composite_score", "ALTER TABLE opportunities ADD COLUMN composite_score REAL DEFAULT 0"),
     ):
         if col not in existing_cols:
             conn.execute(ddl)
 
     conn.commit()
     return conn
+
+
+_CACHED_EVAL_COLUMNS = [
+    "source_url", "relevance_score", "summary", "red_flags", "win_likelihood",
+    "mission_alignment_score", "mission_fit_explanation", "key_requirements", "win_tip",
+]
+
+
+def _load_cached_evaluations(db_path: str, source_urls: list[str]) -> dict[str, dict]:
+    """Look up previously-evaluated RFPs by source_url. A row only exists here
+    if a prior run actually completed LLM evaluation and saved it (Phase 6/7),
+    so presence in the table is a reliable 'already scored' signal."""
+    if not source_urls:
+        return {}
+
+    conn = _init_database(db_path)
+    cached: dict[str, dict] = {}
+    try:
+        urls = list(dict.fromkeys(source_urls))  # de-dupe, preserve order
+        cols = ", ".join(_CACHED_EVAL_COLUMNS)
+        # SQLite caps bound parameters (default 999) — chunk the IN clause.
+        for i in range(0, len(urls), 500):
+            chunk = urls[i:i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT {cols} FROM opportunities WHERE source_url IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for row in rows:
+                record = dict(zip(_CACHED_EVAL_COLUMNS, row))
+                cached[record["source_url"]] = record
+    finally:
+        conn.close()
+    return cached
+
+
+def partition_by_cache(opportunities: list[dict], config: dict) -> tuple[list[dict], list[dict]]:
+    """Runtime fix #3 (incremental evaluation): split keyword-filtered RFPs into
+    (to_evaluate, cached) so a repeat run only spends an LLM call on RFPs that
+    are new since the last run.
+
+    scrape_all() always re-parses each source URL's full listing in full on
+    every run (unchanged), so a newly-posted RFP always shows up here with its
+    own source_url. An opportunity is only treated as 'cached' if THAT exact
+    source_url already has a stored evaluation — a brand new posting on an
+    already-known listing page has a source_url that has never been seen
+    before, so it always falls through to to_evaluate and gets scored by the
+    LLM. Nothing is skipped based on the listing page URL, only on the
+    individual RFP's own URL.
+    """
+    db_path = config.get("output", {}).get("database", {}).get("path", "opportunities.db")
+    rubric_weights = config.get("evaluation", {}).get("rubric_weights", _DEFAULT_RUBRIC_WEIGHTS)
+    min_score = config.get("evaluation", {}).get("min_relevance_score", 5)
+
+    source_urls = [opp.get("source_url", "") for opp in opportunities if opp.get("source_url")]
+    cached_rows = _load_cached_evaluations(db_path, source_urls)
+
+    to_evaluate: list[dict] = []
+    cached: list[dict] = []
+    for opp in opportunities:
+        row = cached_rows.get(opp.get("source_url", ""))
+        if row is None:
+            to_evaluate.append(opp)
+            continue
+
+        opp["relevance_score"] = row["relevance_score"] or 0
+        opp["summary"] = row["summary"] or ""
+        opp["win_likelihood"] = row["win_likelihood"] or "low"
+        opp["mission_alignment_score"] = row["mission_alignment_score"] or 0
+        opp["mission_fit_explanation"] = row["mission_fit_explanation"] or ""
+        opp["win_tip"] = row["win_tip"] or ""
+        try:
+            opp["red_flags"] = json.loads(row["red_flags"]) if row["red_flags"] else []
+        except (json.JSONDecodeError, TypeError):
+            opp["red_flags"] = []
+        try:
+            opp["key_requirements"] = json.loads(row["key_requirements"]) if row["key_requirements"] else []
+        except (json.JSONDecodeError, TypeError):
+            opp["key_requirements"] = []
+
+        # Recompute off the freshly-scraped keyword_score so ranking stays
+        # consistent with current rubric weights even though the LLM
+        # sub-scores (relevance/mission fit) are reused from the prior run.
+        opp["composite_score"] = _compute_composite_score(opp, rubric_weights)
+        opp["meets_relevance_threshold"] = opp["relevance_score"] >= min_score
+        cached.append(opp)
+
+    logger.info(
+        f"Evaluation cache: {len(cached)} already scored (reused, no LLM call), "
+        f"{len(to_evaluate)} new — sending only the new ones to the LLM"
+    )
+    return to_evaluate, cached
 
 
 def save_to_database(opportunities: list[dict], config: dict) -> int:
@@ -734,6 +906,8 @@ def save_to_database(opportunities: list[dict], config: dict) -> int:
                 opp.get("mission_fit_explanation", ""),
                 json.dumps(opp.get("key_requirements", [])),
                 opp.get("win_tip", ""),
+                opp.get("keyword_score", 0.0),
+                opp.get("composite_score", 0.0),
             ))
             if conn.execute("SELECT changes()").fetchone()[0]:
                 saved += 1
@@ -863,8 +1037,6 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     .ring-t { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
     .ring-t .n { font-family: 'Fraunces', Georgia, serif; font-size: 30px; font-weight: 600; color: var(--navy-deep); }
     .ring-t .l { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--ink-soft); }
-    .rail-fit { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; text-align: center; font-size: 13px; font-weight: 700; color: var(--navy); margin-bottom: 22px; }
-    .rail-fit span { display: block; font-size: 20px; font-family: 'Fraunces', Georgia, serif; margin-top: 2px; }
     .rail-h { font-size: 11px; font-weight: 800; letter-spacing: 0.8px; text-transform: uppercase; color: var(--ink-soft); margin: 0 0 12px; }
     .mrow { margin-bottom: 10px; }
     .mrow .top { display: flex; justify-content: space-between; font-size: 12px; font-weight: 700; margin-bottom: 5px; color: #39415a; }
@@ -880,6 +1052,16 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     .kw-pill { background: var(--teal-bg); color: var(--teal-deep); font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 6px; }
     .kw-pill.miss { background: #f0f0f0; color: #aaa; }
 
+    .status-summary-dd { margin: 16px 0; border: 1px solid var(--line); border-radius: 10px; padding: 13px 16px; background: var(--paper); }
+    .status-summary-dd summary { cursor: pointer; font-size: 12px; font-weight: 700; color: var(--navy); list-style: none; }
+    .status-summary-dd summary::-webkit-details-marker { display: none; }
+    .status-summary-dd summary::before { content: "▸ Show summary & what they're looking for"; }
+    .status-summary-dd[open] summary::before { content: "▾ Hide summary & what they're looking for"; }
+    .status-summary-dd[open] summary { margin-bottom: 12px; }
+    .status-summary-dd .d-summary { margin-bottom: 10px; }
+
+    .chip.new-badge { background: rgba(20,184,166,0.18); border-color: rgba(20,184,166,0.45); color: #d7fbf4; }
+
     .rail-meta { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 16px; font-size: 12px; line-height: 1.7; color: var(--ink-soft); }
     .rail-meta b { color: var(--ink); }
     .tagset { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
@@ -894,6 +1076,11 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     .btn-pin.completed { background: var(--teal); border-color: var(--teal-deep); color: #fff; }
 
     .no-results { text-align: center; padding: 60px 20px; color: var(--ink-soft); font-size: 1.05em; background: #fff; border-radius: 16px; border: 1px solid var(--line); }
+
+    .tab-nav { display: flex; gap: 8px; margin-bottom: 22px; }
+    .tab-btn { font-family: 'Inter', sans-serif; font-size: 13px; font-weight: 700; padding: 10px 20px; border-radius: 999px; cursor: pointer; border: 1px solid var(--line); background: #fff; color: var(--ink-soft); }
+    .tab-btn:hover { border-color: var(--navy); color: var(--navy); }
+    .tab-btn.active { background: var(--navy); border-color: var(--navy); color: #fff; }
 
     .footer-bar { background: var(--navy-deep); padding: 18px 32px; display: flex; align-items: center; justify-content: center; gap: 10px; }
     .footer-bar img { height: 18px; }
@@ -911,7 +1098,6 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="hero-top">
       <div class="brand">{% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="wellConnected">{% else %}<strong style="color:#fff;font-family:'Fraunces',serif;font-size:1.2em;">wellConnected</strong>{% endif %}</div>
       <div class="cta">
-        {% if stats_filename %}<a class="btn btn-ghost" href="{{ stats_filename }}" target="_blank" rel="noopener">See the stats</a>{% endif %}
         <button class="btn btn-ghost" onclick="showPinnedView()">📌 Pinned (<span id="pin-count">0</span>)</button>
         <button class="btn btn-ghost" onclick="showStatusView()">📋 Status (<span id="status-count">0</span>)</button>
       </div>
@@ -921,13 +1107,20 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="chips">
       <div class="chip">Generated: <b>{{ report_date }}</b></div>
       <div class="chip">Company: <b>{{ company_name }}</b></div>
-      <div class="chip">Opportunities: <b>{{ opportunities | length }}</b></div>
+      <div class="chip">Matched: <b>{{ current_opportunities | length }}</b></div>
+      <div class="chip new-badge">New Match: <b>{{ new_match_opportunities | length }}</b></div>
+      <div class="chip">All scored: <b>{{ all_opportunities | length }}</b></div>
     </div>
   </div>
 
   <div id="main-view" class="wrap">
-    {% if opportunities %}
-      {% for opp in opportunities %}
+    <div class="tab-nav">
+      <button id="tab-btn-current" class="tab-btn active" onclick="showTab('current')">Matched ({{ current_opportunities | length }})</button>
+      <button id="tab-btn-new-match" class="tab-btn" onclick="showTab('new-match')">New Match ({{ new_match_opportunities | length }})</button>
+      <button id="tab-btn-all" class="tab-btn" onclick="showTab('all')">All Scored RFPs ({{ all_opportunities | length }})</button>
+    </div>
+
+    {% macro render_card(opp) %}
       <div class="dossier">
         <div class="dossier-body">
           <div class="dossier-main">
@@ -978,12 +1171,17 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="rail-score">
               <div class="ring">
                 <svg viewBox="0 0 120 120"><circle class="ring-bg" cx="60" cy="60" r="54"/><circle class="ring-fill" cx="60" cy="60" r="54" style="stroke-dashoffset:{{ opp.score_ring_offset }}"/></svg>
-                <div class="ring-t"><div class="n">{{ opp.relevance_score }}/10</div><div class="l">Score</div></div>
+                <div class="ring-t"><div class="n">{{ opp.composite_score | round | int }}</div><div class="l">Composite / 100</div></div>
               </div>
             </div>
-            {% if opp.mission_alignment_score %}
-            <div class="rail-fit">Mission Fit<span>{{ opp.mission_alignment_score }}/10</span></div>
-            {% endif %}
+
+            <div class="rail-h">Rubric breakdown</div>
+            {% for row in opp.rubric_breakdown %}
+            <div class="mrow">
+              <div class="top"><span>{{ row.label }}</span><span class="s">{{ row.pct }}%</span></div>
+              <div class="track"><div class="fill" style="width:{{ row.pct }}%"></div></div>
+            </div>
+            {% endfor %}
 
             {% if opp.keyword_hits %}
             <div class="rail-h">Match breakdown</div>
@@ -1005,13 +1203,15 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
             {% endfor %}
             {% endif %}
 
+            {% if opp.sole_source_flag or opp.optional_matched_flat %}
             <div class="rail-meta">
-              <b>Win likelihood:</b> {{ opp.win_likelihood | capitalize }}{% if opp.sole_source_flag %} &middot; <span class="sole-tag">Sole source</span>{% endif %}
+              {% if opp.sole_source_flag %}<span class="sole-tag">Sole source</span>{% endif %}
               {% if opp.optional_matched_flat %}
               <br><b>Optional matches</b>
               <div class="tagset">{% for kw in opp.optional_matched_flat %}<span class="tag">{{ kw }}</span>{% endfor %}</div>
               {% endif %}
             </div>
+            {% endif %}
 
             <div class="rail-actions">
               <a class="btn btn-primary" href="{{ opp.source_url }}" target="_blank" rel="noopener">View opportunity →</a>
@@ -1019,10 +1219,28 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
           </aside>
         </div>
       </div>
-      {% endfor %}
-    {% else %}
-    <div class="no-results">No opportunities met the criteria for this report period.</div>
-    {% endif %}
+    {% endmacro %}
+
+    <div id="tab-current" class="tab-panel">
+      {% if current_opportunities %}
+        {% for opp in current_opportunities %}{{ render_card(opp) }}{% endfor %}
+      {% else %}
+        <div class="no-results">No opportunities meet the {{ min_relevance_score }}/10 relevance threshold this run — check the "All Scored RFPs" tab.</div>
+      {% endif %}
+    </div>
+
+    <div id="tab-new-match" class="tab-panel" style="display:none;">
+      <div id="new-match-empty" class="no-results"{% if new_match_opportunities %} style="display:none;"{% endif %}>No new matches right now — the next run will surface anything freshly posted and relevant that you haven't reviewed yet.</div>
+      {% for opp in new_match_opportunities %}{{ render_card(opp) }}{% endfor %}
+    </div>
+
+    <div id="tab-all" class="tab-panel" style="display:none;">
+      {% if all_opportunities %}
+        {% for opp in all_opportunities %}{{ render_card(opp) }}{% endfor %}
+      {% else %}
+        <div class="no-results">No opportunities were scraped this run.</div>
+      {% endif %}
+    </div>
   </div>
 
   <div id="pinned-view" class="wrap" style="display:none;">
@@ -1172,6 +1390,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function unpinFromCard(btn) {
+      if (!confirm('Are you sure you want to unpin this RFP?')) return;
       unpin(btn.getAttribute('data-url'));
     }
 
@@ -1197,8 +1416,25 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
       closeAllStatusMenus();
     }
 
+    // A New Match RFP counts as "checked out" the moment any status is set on
+    // it — unlike Matched/All (where only "completed" dims/reorders the card),
+    // New Match removes it outright so the section stays limited to genuinely
+    // untouched, freshly-posted matches.
+    function refreshNewMatchCount() {
+      const panel = document.getElementById('tab-new-match');
+      const btn = document.getElementById('tab-btn-new-match');
+      if (!panel || !btn) return;
+      const visible = Array.from(panel.querySelectorAll(':scope > .dossier')).filter(function (c) {
+        return c.style.display !== 'none';
+      });
+      btn.textContent = 'New Match (' + visible.length + ')';
+      const emptyMsg = document.getElementById('new-match-empty');
+      if (emptyMsg) emptyMsg.style.display = visible.length ? 'none' : 'block';
+    }
+
     // Applies a status change and syncs every status-icon on the page that refers
-    // to this RFP (there can be one in the main list and one in the Status tab).
+    // to this RFP (there can be one in the main list, Pinned tab, New Match tab,
+    // and the Status tab).
     function applyStatus(opp, status) {
       setStatus(opp.source_url, opp, status);
       document.querySelectorAll('.status-icon[data-opp]').forEach(function (btn) {
@@ -1213,8 +1449,12 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
           if (status === 'completed' && card.parentNode) card.parentNode.appendChild(card);
           else reinsertInOrder(card);
         }
+        if (card && card.closest('#tab-new-match')) {
+          card.style.display = status === 'not_started' ? '' : 'none';
+        }
       });
       renderStatusTab();
+      refreshNewMatchCount();
     }
 
     function submitLog(btn) {
@@ -1236,15 +1476,16 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
         .replace(/'/g, '&#39;');
     }
 
-    function miniDossierHtml(opp, actionsHtml) {
+    function miniDossierHtml(opp, actionsHtml, statusHtml) {
       let html = '<div class="dossier"><div class="dossier-main" style="border-right:none;">';
       html += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:8px;">';
       html += '<h2 class="d-title" style="margin:0;">' + escapeHtml(opp.title || 'Untitled Opportunity') + '</h2>';
-      html += '<div style="display:flex;gap:8px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;">';
+      html += '<div style="display:flex;gap:8px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;align-items:center;">';
       html += '<span class="chip" style="background:var(--teal-bg);color:var(--teal-deep);border:none;">Score: ' + (opp.relevance_score || 0) + '/10</span>';
       if (opp.mission_alignment_score) {
         html += '<span class="chip" style="background:var(--blue-bg);color:var(--navy);border:none;">Fit: ' + opp.mission_alignment_score + '/10</span>';
       }
+      if (statusHtml) html += statusHtml;
       html += '</div></div>';
       html += '<div class="facts">';
       if (opp.agency_or_funder) html += '<div class="fact"><div class="k">Agency / Funder</div><div class="v">' + escapeHtml(opp.agency_or_funder) + '</div></div>';
@@ -1265,9 +1506,13 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function pinnedCardHtml(opp) {
+      const rec = getStatusRecord(opp.source_url);
+      const currentStatus = rec ? rec.status : 'not_started';
       const actions = '<button class="btn-pin pinned" data-url="' + escapeHtml(opp.source_url) + '" onclick="unpinFromCard(this)" title="Unpin this RFP"><span>📌</span><span class="pin-label">Pinned</span></button>' +
         '<a class="btn btn-primary" href="' + escapeHtml(opp.source_url) + '" target="_blank" rel="noopener">View opportunity →</a>';
-      return miniDossierHtml(opp, actions);
+      // Same status icon + dropdown as the home page cards (statusDropdownHtml),
+      // so status can be set directly from the Pinned tab without leaving it.
+      return miniDossierHtml(opp, actions, statusDropdownHtml(opp, currentStatus));
     }
 
     function renderPinned() {
@@ -1330,6 +1575,16 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
       if (opp.deadline) html += '<div class="fact"><div class="k">Deadline</div><div class="v">' + escapeHtml(opp.deadline) + '</div></div>';
       if (opp.estimated_value) html += '<div class="fact"><div class="k">Est. Value</div><div class="v">' + escapeHtml(opp.estimated_value) + '</div></div>';
       html += '</div>';
+      if (opp.summary || (opp.key_requirements && opp.key_requirements.length)) {
+        html += '<details class="status-summary-dd"><summary></summary>';
+        if (opp.summary) html += '<p class="d-summary">' + escapeHtml(opp.summary) + '</p>';
+        if (opp.key_requirements && opp.key_requirements.length) {
+          html += '<div class="sec-h" style="margin-top:10px;">What this RFP is looking for</div><ul class="looking">';
+          opp.key_requirements.forEach(function (req) { html += '<li>' + escapeHtml(req) + '</li>'; });
+          html += '</ul>';
+        }
+        html += '</details>';
+      }
       if (record.status === 'in_progress') {
         html += '<div class="sec-h">Log an update</div>';
         html += '<div class="log-form">';
@@ -1375,6 +1630,15 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('main-view').style.display = 'block';
     }
 
+    function showTab(name) {
+      document.getElementById('tab-current').style.display = name === 'current' ? 'block' : 'none';
+      document.getElementById('tab-new-match').style.display = name === 'new-match' ? 'block' : 'none';
+      document.getElementById('tab-all').style.display = name === 'all' ? 'block' : 'none';
+      document.getElementById('tab-btn-current').classList.toggle('active', name === 'current');
+      document.getElementById('tab-btn-new-match').classList.toggle('active', name === 'new-match');
+      document.getElementById('tab-btn-all').classList.toggle('active', name === 'all');
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
       document.querySelectorAll('#main-view .dossier').forEach(function (card, i) {
         card.dataset.order = i;
@@ -1394,9 +1658,16 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
           card.classList.toggle('is-in-progress', status === 'in_progress');
           if (status === 'completed') card.parentNode.appendChild(card);
         }
+        // In case localStorage already tracked this RFP (e.g. from before the
+        // report was last regenerated), New Match should honor that immediately
+        // rather than waiting for the next status change to hide it.
+        if (card && card.closest('#tab-new-match') && status !== 'not_started') {
+          card.style.display = 'none';
+        }
       });
       renderPinned();
       renderStatusTab();
+      refreshNewMatchCount();
     });
   </script>
 </body>
@@ -1404,7 +1675,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
-def generate_report(opportunities: list[dict], config: dict, stats_filename: str = "") -> str:
+def generate_report(opportunities: list[dict], config: dict) -> str:
     logger.info("=== STAGE: REPORT GENERATION ===")
 
     report_cfg = config.get("output", {}).get("report", {})
@@ -1412,18 +1683,22 @@ def generate_report(opportunities: list[dict], config: dict, stats_filename: str
     max_opps = report_cfg.get("max_opportunities_per_report", 50)
     company_name = config.get("company_profile", {}).get("name", "")
 
+    min_relevance_score = config.get("evaluation", {}).get("min_relevance_score", 5)
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    # Rank by relevance first, but let strong mission fit break ties/nudge order —
-    # a genuinely mission-aligned RFP should surface even if its raw relevance score is close.
-    sorted_opps = sorted(
+    # Rank by the composite rubric score (Phase 8: keyword_score + relevance_score +
+    # mission_alignment_score, weighted per config["evaluation"]["rubric_weights"]).
+    # Raw relevance_score is the tiebreaker for opportunities with an identical composite.
+    # Precompute over every ranked opportunity once — "Current" and "All" below are
+    # just two views (a filtered subset and the full set) over these same objects.
+    ranked_opps = sorted(
         opportunities,
-        key=lambda x: (x.get("relevance_score", 0), x.get("mission_alignment_score", 0)),
+        key=lambda x: (x.get("composite_score", 0), x.get("relevance_score", 0)),
         reverse=True,
-    )[:max_opps]
+    )
 
-    # Deserialize fields that were round-tripped through the DB as JSON strings
-    for opp in sorted_opps:
+    for opp in ranked_opps:
         if isinstance(opp.get("red_flags"), str):
             try:
                 opp["red_flags"] = json.loads(opp["red_flags"])
@@ -1451,8 +1726,17 @@ def generate_report(opportunities: list[dict], config: dict, stats_filename: str
         ]
 
         # Ring-chart stroke-dashoffset for a circle of radius 54 (circumference ≈ 339.292).
-        score = min(10, max(0, opp.get("relevance_score", 0) or 0))
-        opp["score_ring_offset"] = round(339.292 * (1 - score / 10), 1)
+        composite = min(100, max(0, opp.get("composite_score", 0) or 0))
+        opp["score_ring_offset"] = round(339.292 * (1 - composite / 100), 1)
+
+        # Phase 8 rubric breakdown — the same weighted components that make up
+        # composite_score, shown as individual progress rows in the report rail.
+        # win_likelihood is deliberately not part of the rubric or this breakdown.
+        opp["rubric_breakdown"] = [
+            {"label": "Keyword Match", "pct": round((opp.get("keyword_score", 0) or 0) * 100)},
+            {"label": "Relevance", "pct": round((opp.get("relevance_score", 0) or 0) * 10)},
+            {"label": "Mission Fit", "pct": round((opp.get("mission_alignment_score", 0) or 0) * 10)},
+        ]
 
         # Payload embedded in the pin button so a pinned RFP can be re-rendered client-side
         # (via localStorage) without needing the full pipeline dataset around.
@@ -1466,6 +1750,7 @@ def generate_report(opportunities: list[dict], config: dict, stats_filename: str
             "relevance_score": opp.get("relevance_score", 0),
             "mission_alignment_score": opp.get("mission_alignment_score", 0),
             "keyword_score": opp.get("keyword_score", 0),
+            "composite_score": opp.get("composite_score", 0),
             "summary": opp.get("summary", ""),
             "mission_fit_explanation": opp.get("mission_fit_explanation", ""),
             "win_tip": opp.get("win_tip", ""),
@@ -1473,14 +1758,27 @@ def generate_report(opportunities: list[dict], config: dict, stats_filename: str
         }
         opp["pin_payload"] = _escape_for_html_attr(json.dumps(pin_data))
 
+    # "Matched" = today's stricter view (meets the configured relevance threshold).
+    # "All" = every scraped RFP that made it through keyword/eligibility filtering,
+    # ranked by the same rubric — nothing is hidden just for scoring low on relevance.
+    # "New Match" = the intersection of matched + is_new (never scored before this
+    # run — see partition_by_cache()/run_pipeline()). Whether the user has already
+    # "checked it out" is tracked client-side (localStorage status), so the JS
+    # further hides any of these once a status other than not_started is set.
+    current_opps = [o for o in ranked_opps if o.get("meets_relevance_threshold")][:max_opps]
+    new_match_opps = [o for o in current_opps if o.get("is_new")]
+    all_opps = ranked_opps[:max_opps]
+
     report_date = datetime.now().strftime("%Y-%m-%d %H:%M")
     filepath = os.path.join(output_dir, "report.html")
 
     html = Template(_HTML_TEMPLATE).render(
-        opportunities=sorted_opps,
+        current_opportunities=current_opps,
+        new_match_opportunities=new_match_opps,
+        all_opportunities=all_opps,
+        min_relevance_score=min_relevance_score,
         report_date=report_date,
         company_name=company_name,
-        stats_filename=stats_filename,
         logo_data_uri=_encode_asset_data_uri("assets/wellconnected-footer.png"),
         footer_logo_data_uri=_encode_asset_data_uri("assets/wellconnected-footer.png"),
     )
@@ -1488,7 +1786,10 @@ def generate_report(opportunities: list[dict], config: dict, stats_filename: str
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(html)
 
-    logger.info(f"Report saved: {filepath} ({len(sorted_opps)} opportunities)")
+    logger.info(
+        f"Report saved: {filepath} "
+        f"({len(current_opps)} in Matched, {len(new_match_opps)} in New Match, {len(all_opps)} in All)"
+    )
     return filepath
 
 
@@ -1756,12 +2057,26 @@ def run_pipeline(config: dict) -> None:
     filtered = keyword_filter(to_score, config)
 
     output_dir = config.get("output", {}).get("report", {}).get("output_path", "reports/")
-    stats_path = generate_debug_report(len(raw), filtered, excluded_records, output_dir)
+    # Still written to disk as a diagnostic artifact (and used by `--debug`),
+    # just no longer linked from the report UI ("See the stats" tab removed).
+    generate_debug_report(len(raw), filtered, excluded_records, output_dir)
 
-    evaluated = llm_evaluate(filtered, config)
+    # Runtime fix #3: only send RFPs the LLM hasn't already scored. scrape_all()
+    # above always re-parses every listing page in full, so a newly-posted RFP
+    # (new source_url) always lands in to_evaluate — see partition_by_cache().
+    to_evaluate, cached = partition_by_cache(filtered, config)
+    newly_evaluated = llm_evaluate(to_evaluate, config)
+    # is_new marks RFPs that were never scored before *this* run — the report's
+    # "New Match" section combines this with meets_relevance_threshold (and,
+    # client-side, with "not yet reviewed") to surface freshly-posted good fits.
+    for opp in newly_evaluated:
+        opp["is_new"] = True
+    for opp in cached:
+        opp["is_new"] = False
+    evaluated = cached + newly_evaluated
     eligible = eligibility_check(evaluated, config)
     save_to_database(eligible, config)
-    report_path = generate_report(eligible, config, stats_filename=os.path.basename(stats_path))
+    report_path = generate_report(eligible, config)
     send_notifications(eligible, report_path, config)
 
     elapsed = (datetime.now() - start).seconds

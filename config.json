@@ -190,6 +190,13 @@
     "min_days_until_deadline": 7,
     "max_days_until_deadline": 365,
     "flag_sole_source": true,
+    "batch_poll_interval_seconds": 15,
+    "batch_timeout_seconds": 3600,
+    "rubric_weights": {
+      "keyword_score": 0.45,
+      "relevance_score": 0.35,
+      "mission_alignment_score": 0.2
+    },
     "evaluation_prompt_template": "You are evaluating an RFP/grant opportunity for {name}, the company behind {platform}.\n\nProduct: {product}\nMission: {mission}\nCore problem being solved: {core_problem}\nPrimary users: {primary_users}\nKey functionality: {key_functionality}\nGeographic focus: {geographic_focus}\nCompany values: {values}\nPriority themes (core to {name}'s identity — weigh these heavily when judging mission fit, even if the RFP doesn't use this exact terminology): {priority_themes}\n\nAdditional company background:\n{mission_detail}\n\nKeyword match score (0-1, higher = more overlap): {keyword_score}\nKeyword matches by category:\n{keyword_matches_summary}\n\nOpportunity:\nTitle: {title}\nAgency/Funder: {agency_or_funder}\nDeadline: {deadline}\nEstimated Value: {estimated_value}\nDescription: {description}\n\nEvaluate how well this opportunity fits {name} and {platform}. Consider: relevance to our data-sharing and SDOH mission, geographic fit, realistic win likelihood, and any red flags such as sole-source requirements or mismatched scope.\n\nSeparately from relevance_score, give a mission_alignment_score (1-10) rating how genuinely this opportunity aligns with {name}'s mission of CBO collaboration, social care infrastructure, and health equity — judge real mission fit, not just keyword overlap. Also write a short (1-3 sentence) mission_fit_explanation in plain language, suitable for a report section titled \"Why this fits {name}\", explaining how this opportunity connects (or doesn't) to the company's mission.\n\nAlso provide key_requirements: 3-6 short bullet points stating what this RFP/grant is specifically looking for (scope of work, deliverables, eligibility requirements). And provide win_tip: one concise, specific, actionable tip for how {name} could strengthen its odds of winning this particular opportunity."
   },
 
