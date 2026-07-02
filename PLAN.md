@@ -182,3 +182,112 @@ The threshold for triggering the alert (e.g. 90%) should be a configurable value
 - `--debug` report updated: now shows all 212 RFPs ranked by score with their full keyword checklist, instead of the old rejection list.
 
 **Result:** 212 RFPs now reach the LLM (previously 0). The most keyword-aligned opportunities are evaluated first.
+
+### Phase 6 — Company Profile-Based RFP Relevance Matching ✅ DONE
+
+**What changed:**
+- `config.json` → `company_profile` expanded with `product`, `mission` (tagline), `mission_detail` (prior descriptive paragraph), `core_problem`, `primary_users`, `key_functionality`, `geographic_focus`, `values`, and `priority_themes` — sourced from `WellConnected_Company_Overview.html`.
+- `evaluation_prompt_template` rewritten to inject the full profile (lists are joined into readable strings by `_build_evaluation_prompt`) and explicitly ask Claude to judge genuine mission fit, not just keyword overlap, weighing the `priority_themes` list heavily.
+- `_EVALUATION_TOOL` tool-use schema gains two new required fields: `mission_alignment_score` (1–10) and `mission_fit_explanation` (1–3 sentence plain-language reasoning). `_parse_llm_response`'s text fallback also parses these.
+- `opportunities.db` schema gains `mission_alignment_score` / `mission_fit_explanation` columns, with an `ALTER TABLE` migration in `_init_database` so existing databases upgrade in place without data loss.
+- HTML report: each card now shows a "Mission Fit: X/10" badge next to the relevance score, plus a "Why this fits wellConnected" callout box rendering `mission_fit_explanation`.
+- Report sort order now ranks by `(relevance_score, mission_alignment_score)` so, among equally relevant RFPs, the more mission-aligned one surfaces first.
+
+**Result:** The agent now reasons about *why* an RFP fits wellConnected's mission — CBO collaboration, SDOH, health equity, 211/social-service integration, nonprofit compliance — instead of relying solely on keyword overlap, and that reasoning is visible in the report.
+
+### Phase 7 — Single Persistent Report + Integrated Keyword Scorer ✅ DONE
+
+**What changed:**
+- `generate_report()` now writes to a fixed `reports/report.html` every run instead of a new `report_<timestamp>.html` file each time — one file that gets overwritten, not an ever-growing folder of one-off reports.
+- `run_pipeline()` now calls `webbrowser.open()` on `report.html` after generation, so running `python main.py` opens the latest results automatically instead of requiring you to go find the file.
+- The keyword-scorer debug view (`generate_debug_report`, previously only reachable via `python main.py --debug`) is now generated on **every** normal pipeline run too, saved as a fixed `reports/stats.html` alongside the main report.
+- Extracted the excluded-keyword-splitting logic (previously duplicated between `run_debug` and implicitly inside `keyword_filter`) into a shared `_split_excluded()` helper, used by both `run_debug` and `run_pipeline`.
+- Main report's navbar gained a "See the stats" link (`stats_filename` passed into the Jinja template) that opens `stats.html` in a new tab — so the keyword-match breakdown is one click away from the results report instead of a separate CLI invocation.
+
+**Result:** `python main.py` now produces exactly two live artifacts — `reports/report.html` and `reports/stats.html` — and opens the report in the browser automatically when the run finishes. Older timestamped report files from prior runs still exist on disk but are no longer produced going forward.
+
+---
+
+Original feature request (for reference):
+
+
+
+Add a new implementation to the AI Agent that scores and recommends RFPs based on wellConnected's specific company values, goals, and mission. Use the following company profile information extracted directly from the codebase:
+Company Profile to embed in config.json under company_profile:
+
+Product: allco — the first centralized social care platform built to streamline workflow processes for CBOs (Community-Based Organizations)
+Mission: Collaborative community care, all in one place
+Core problem being solved: Fragmentation — separate organizations working off disconnected, isolated systems instead of shared connected data
+Primary users: Organization Admins at CBOs, nonprofits, and hospitals — not individual consumers
+Key functionality: Cross-organization referrals, case sharing, community member identity reconciliation across agencies (MPI), social determinants of health (SDOH) services
+Geographic focus: New York (governing law), Western New York, Buffalo
+Values inferred from the codebase:
+
+Collaboration over silos
+Meeting people where the existing system already is (e.g. integrating with 211 rather than replacing it)
+Formal accountability to nonprofit/CBO sector compliance structures (501(c)(3), tax status tracking)
+Consolidation as the core pitch
+
+
+
+What to build:
+
+Add the company profile above into config.json under a company_profile section so it can be referenced across the pipeline
+In the LLM evaluation prompt, inject the full company profile so Claude can reason about whether each RFP is genuinely aligned with wellConnected's mission — not just keyword matching but actual mission fit
+Add a mission_alignment_score field to the LLM evaluation output alongside the existing relevance_score, specifically rating how well the RFP aligns with wellConnected's goals of CBO collaboration, social care infrastructure, and health equity
+In the final HTML report, display a "Why this fits wellConnected" section for each recommended RFP explaining in plain language how it connects to the company's mission
+Prioritize RFPs that mention any of the following themes, as they are core to wellConnected's identity:
+
+CBO or nonprofit technology infrastructure
+Social determinants of health (SDOH)
+Care coordination or referral management
+Health equity or community health
+Data sharing between healthcare and social service organizations
+211 integration or social service navigation
+Nonprofit compliance or 501(c)(3) organizations
+
+
+
+The goal is to move beyond generic keyword matching and have the agent understand why a grant is or isn't a good fit for this specific company.
+
+Phase 7: 
+
+Update the HTML report page with the following changes:
+Remove:
+
+The keyword match breakdown that currently appears in the report body — this information is already available in the "See score breakdown" dropdown so it is redundant
+
+Add the following three sections to each RFP card:
+
+RFP Summary & Key Points
+
+A short 2-3 sentence plain language summary of what the RFP is about
+A highlights section that calls out:
+
+How much funding is being offered
+The deadline
+What they are specifically looking for in an applicant
+Any eligibility requirements
+
+
+
+
+Stats Dropdown
+
+A collapsible <details> section labeled "Stats"
+When opened it shows the scores specific to that RFP:
+
+Relevance score
+Mission alignment score
+Keyword score
+Win likelihood
+
+
+Display these visually with a simple progress bar or percentage so it is easy to read at a glance
+
+
+How wellConnected Can Win This RFP
+
+A dedicated section generated by Claude giving specific actionable advice on how wellConnected should position itself to win this particular grant
+This should reference wellConnected's actual strengths — CBO collaboration, centralized social care platform, SDOH focus, cross-organization referral system — and connect them directly to what the RFP is asking for
+Should also flag any gaps or weaknesses wellConnected should address in their application

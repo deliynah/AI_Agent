@@ -4,6 +4,7 @@ Scrapes, filters, evaluates, stores, and reports on opportunities.
 """
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -257,6 +258,26 @@ def scrape_all(config: dict) -> list[dict]:
 # 3. KEYWORD FILTER
 # ──────────────────────────────────────────────────────────────
 
+def _split_excluded(opportunities: list[dict], config: dict) -> tuple[list[dict], list[dict]]:
+    """Split opportunities into (to_score, excluded_records) based on excluded keywords."""
+    excluded_kws = [kw.lower() for kw in config.get("keywords", {}).get("excluded", [])]
+
+    to_score: list[dict] = []
+    excluded_records: list[dict] = []
+    for opp in opportunities:
+        text = (opp.get("title", "") + " " + opp.get("description", "")).lower()
+        triggered = next((kw for kw in excluded_kws if kw in text), None)
+        if triggered:
+            excluded_records.append({
+                "title": opp.get("title", ""),
+                "url": opp.get("source_url", ""),
+                "triggered_keyword": triggered,
+            })
+        else:
+            to_score.append(opp)
+    return to_score, excluded_records
+
+
 def keyword_filter(opportunities: list[dict], config: dict) -> list[dict]:
     logger.info("=== STAGE: KEYWORD FILTER ===")
 
@@ -287,12 +308,17 @@ def keyword_filter(opportunities: list[dict], config: dict) -> list[dict]:
         required_matched = sum(hit for m in required_matches.values() for hit in m.values())
         required_total = sum(len(kws) for kws in required.values())
 
-        optional_matched = sum(1 for kws in optional.values() for kw in kws if kw in text)
+        optional_matches = {
+            cat: [kw for kw in kws if kw in text]
+            for cat, kws in optional.items()
+        }
+        optional_matched = sum(len(kws) for kws in optional_matches.values())
         optional_total = sum(len(kws) for kws in optional.values())
 
         total = required_total + optional_total
         opp["keyword_matches"] = required_matches
         opp["keyword_score"] = round((required_matched + optional_matched) / total, 3) if total else 0.0
+        opp["optional_keyword_matches"] = optional_matches
         opp["optional_keyword_count"] = optional_matched
         opp["optional_keyword_total"] = optional_total
         passed.append(opp)
@@ -325,7 +351,11 @@ def _build_evaluation_prompt(template: str, company_profile: dict, opportunity: 
     keyword_matches_summary = _format_keyword_matches_summary(opportunity)
     context = {**company_profile, **opportunity, "keyword_matches_summary": keyword_matches_summary}
     for key, value in context.items():
-        if not isinstance(value, (str, int, float, bool, type(None))):
+        if isinstance(value, (list, tuple)):
+            value = "; ".join(str(v) for v in value)
+        elif isinstance(value, dict):
+            continue
+        elif not isinstance(value, (str, int, float, bool, type(None))):
             continue
         template = template.replace(f"{{{key}}}", str(value))
     return template
@@ -337,6 +367,10 @@ def _parse_llm_response(text: str) -> dict:
         "summary": "",
         "red_flags": [],
         "win_likelihood": "low",
+        "mission_alignment_score": 0,
+        "mission_fit_explanation": "",
+        "key_requirements": [],
+        "win_tip": "",
     }
 
     # Prefer an explicit JSON code block
@@ -348,19 +382,42 @@ def _parse_llm_response(text: str) -> dict:
             result["summary"] = str(parsed.get("summary", ""))
             result["red_flags"] = list(parsed.get("red_flags", []))
             result["win_likelihood"] = str(parsed.get("win_likelihood", "low")).lower()
+            result["mission_alignment_score"] = int(parsed.get("mission_alignment_score", 0))
+            result["mission_fit_explanation"] = str(parsed.get("mission_fit_explanation", ""))
+            result["key_requirements"] = list(parsed.get("key_requirements", []))
+            result["win_tip"] = str(parsed.get("win_tip", ""))
             return result
         except (json.JSONDecodeError, ValueError):
             pass
 
     # Fallback: parse line-by-line
+    in_requirements = False
     for line in text.splitlines():
         stripped = line.strip()
-        if re.search(r"relevance.?score", stripped, re.IGNORECASE):
+        if re.search(r"key.?requirements", stripped, re.IGNORECASE):
+            in_requirements = True
+            continue
+        if in_requirements and re.match(r"[-•]\s*", stripped):
+            requirement = re.sub(r"^[-•]\s*", "", stripped).strip()
+            if requirement:
+                result["key_requirements"].append(requirement)
+            continue
+        in_requirements = False
+
+        if re.search(r"mission.?alignment.?score", stripped, re.IGNORECASE):
+            m = re.search(r"(\d+)", stripped)
+            if m:
+                result["mission_alignment_score"] = min(10, max(1, int(m.group(1))))
+        elif re.search(r"relevance.?score", stripped, re.IGNORECASE):
             m = re.search(r"(\d+)", stripped)
             if m:
                 result["relevance_score"] = min(10, max(1, int(m.group(1))))
         elif re.match(r"summary\s*[:\-]", stripped, re.IGNORECASE):
             result["summary"] = stripped.split(":", 1)[-1].strip()
+        elif re.search(r"mission.?fit.?explanation", stripped, re.IGNORECASE):
+            result["mission_fit_explanation"] = stripped.split(":", 1)[-1].strip()
+        elif re.search(r"win.?tip", stripped, re.IGNORECASE):
+            result["win_tip"] = stripped.split(":", 1)[-1].strip()
         elif re.search(r"win.?likelihood", stripped, re.IGNORECASE):
             for level in ("high", "medium", "low"):
                 if level in stripped.lower():
@@ -403,8 +460,51 @@ _EVALUATION_TOOL = {
                 "enum": ["low", "medium", "high"],
                 "description": "Estimated probability of winning this opportunity.",
             },
+            "mission_alignment_score": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": (
+                    "Rating (1-10) of how genuinely this opportunity aligns with the "
+                    "company's mission of CBO collaboration, social care infrastructure, "
+                    "and health equity — judge real mission fit, not just keyword overlap."
+                ),
+            },
+            "mission_fit_explanation": {
+                "type": "string",
+                "description": (
+                    "1-3 sentence plain-language explanation of how this opportunity does "
+                    "or doesn't connect to the company's mission, for display in a "
+                    "\"Why this fits\" report section."
+                ),
+            },
+            "key_requirements": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "3-6 short bullet points describing what this RFP/grant is specifically "
+                    "looking for — scope of work, deliverables, eligibility requirements, "
+                    "or qualifications the funder expects from an applicant."
+                ),
+            },
+            "win_tip": {
+                "type": "string",
+                "description": (
+                    "One concise, specific, actionable tip for how wellConnected could "
+                    "strengthen its odds of winning this particular opportunity."
+                ),
+            },
         },
-        "required": ["relevance_score", "summary", "red_flags", "win_likelihood"],
+        "required": [
+            "relevance_score",
+            "summary",
+            "red_flags",
+            "win_likelihood",
+            "mission_alignment_score",
+            "mission_fit_explanation",
+            "key_requirements",
+            "win_tip",
+        ],
     },
 }
 
@@ -451,6 +551,10 @@ def llm_evaluate(opportunities: list[dict], config: dict) -> list[dict]:
                     "summary": str(inp.get("summary", "")),
                     "red_flags": list(inp.get("red_flags", [])),
                     "win_likelihood": str(inp.get("win_likelihood", "low")).lower(),
+                    "mission_alignment_score": min(10, max(1, int(inp.get("mission_alignment_score", 0)))),
+                    "mission_fit_explanation": str(inp.get("mission_fit_explanation", "")),
+                    "key_requirements": list(inp.get("key_requirements", [])),
+                    "win_tip": str(inp.get("win_tip", "")),
                 }
             else:
                 response_text = next(
@@ -563,7 +667,11 @@ CREATE TABLE IF NOT EXISTS opportunities (
     win_likelihood    TEXT DEFAULT 'low',
     sole_source_flag  INTEGER DEFAULT 0,
     scraped_at        TEXT,
-    status            TEXT DEFAULT 'new'
+    status            TEXT DEFAULT 'new',
+    mission_alignment_score INTEGER DEFAULT 0,
+    mission_fit_explanation TEXT,
+    key_requirements  TEXT,
+    win_tip           TEXT
 )
 """
 
@@ -571,8 +679,9 @@ _INSERT_OPPORTUNITY = """
 INSERT OR IGNORE INTO opportunities
     (title, description, source_url, deadline, estimated_value,
      agency_or_funder, source_name, relevance_score, summary,
-     red_flags, win_likelihood, sole_source_flag, scraped_at, status)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     red_flags, win_likelihood, sole_source_flag, scraped_at, status,
+     mission_alignment_score, mission_fit_explanation, key_requirements, win_tip)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -580,6 +689,18 @@ def _init_database(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.execute(_CREATE_TABLE)
+
+    # Migrate older databases created before mission-alignment/win-tip columns existed.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(opportunities)")}
+    for col, ddl in (
+        ("mission_alignment_score", "ALTER TABLE opportunities ADD COLUMN mission_alignment_score INTEGER DEFAULT 0"),
+        ("mission_fit_explanation", "ALTER TABLE opportunities ADD COLUMN mission_fit_explanation TEXT"),
+        ("key_requirements", "ALTER TABLE opportunities ADD COLUMN key_requirements TEXT"),
+        ("win_tip", "ALTER TABLE opportunities ADD COLUMN win_tip TEXT"),
+    ):
+        if col not in existing_cols:
+            conn.execute(ddl)
+
     conn.commit()
     return conn
 
@@ -609,6 +730,10 @@ def save_to_database(opportunities: list[dict], config: dict) -> int:
                 int(bool(opp.get("sole_source_flag", False))),
                 scraped_at,
                 "new",
+                opp.get("mission_alignment_score", 0),
+                opp.get("mission_fit_explanation", ""),
+                json.dumps(opp.get("key_requirements", [])),
+                opp.get("win_tip", ""),
             ))
             if conn.execute("SELECT changes()").fetchone()[0]:
                 saved += 1
@@ -631,117 +756,655 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RFP &amp; Grant Opportunities — {{ report_date }}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
+    :root {
+      --navy:#14328f; --navy-deep:#0c2166; --teal:#14b8a6; --teal-deep:#0d9488;
+      --teal-bg:#e6f7f4; --amber:#f5a623; --amber-bg:#fdf3df; --red:#e2543d; --red-bg:#fbe9e6;
+      --orange:#f6a936; --ink:#16203c; --ink-soft:#5b6478; --paper:#f6f7fb; --line:#e4e7f0;
+      --cream:#faf8f3; --blue-bg:#eaf1ff;
+    }
     * { box-sizing: border-box; }
-    body { font-family: Arial, sans-serif; max-width: 1100px; margin: 0 auto; padding: 24px; background: #f4f6f8; color: #222; }
-    h1 { color: #1a2638; border-bottom: 3px solid #2e86de; padding-bottom: 10px; margin-bottom: 4px; }
-    .meta { color: #666; margin-bottom: 28px; font-size: 0.92em; }
-    .card { background: #fff; border-radius: 8px; padding: 20px 24px; margin-bottom: 18px; box-shadow: 0 1px 4px rgba(0,0,0,0.10); }
-    .card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-    .title { font-size: 1.15em; font-weight: bold; color: #1a2638; margin: 0; flex: 1; }
-    .score-high   { background: #27ae60; color: #fff; padding: 4px 13px; border-radius: 20px; font-weight: bold; white-space: nowrap; }
-    .score-medium { background: #f39c12; color: #fff; padding: 4px 13px; border-radius: 20px; font-weight: bold; white-space: nowrap; }
-    .score-low    { background: #e74c3c; color: #fff; padding: 4px 13px; border-radius: 20px; font-weight: bold; white-space: nowrap; }
-    .meta-row { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 0 6px; font-size: 0.88em; color: #555; }
-    .meta-row strong { color: #333; }
-    .likelihood-high   { display:inline-block; padding:2px 9px; border-radius:12px; font-size:0.85em; font-weight:bold; background:#d5f5e3; color:#27ae60; }
-    .likelihood-medium { display:inline-block; padding:2px 9px; border-radius:12px; font-size:0.85em; font-weight:bold; background:#fef9e7; color:#d68910; }
-    .likelihood-low    { display:inline-block; padding:2px 9px; border-radius:12px; font-size:0.85em; font-weight:bold; background:#fadbd8; color:#e74c3c; }
-    .sole-source { background:#fff3cd; color:#856404; padding:2px 9px; border-radius:12px; font-size:0.82em; font-weight:bold; }
-    .summary { color:#444; margin:10px 0 6px; line-height:1.55; font-size:0.95em; }
-    .red-flags { background:#fff5f5; border-left:4px solid #e74c3c; padding:8px 12px; border-radius:0 4px 4px 0; margin-top:10px; }
-    .red-flags strong { color:#c0392b; }
-    .red-flags ul { margin:4px 0 0; padding-left:18px; }
-    .red-flags li { font-size:0.9em; color:#555; }
-    .view-link { display:inline-block; margin-top:10px; color:#2e86de; font-size:0.9em; text-decoration:none; }
-    .view-link:hover { text-decoration:underline; }
-    .no-results { text-align:center; padding:60px 20px; color:#999; font-size:1.1em; }
-    .kw-checklist { margin:10px 0; padding:10px 14px; background:#f9fbfd; border-radius:6px; border:1px solid #e8edf2; }
-    .kw-cat-row { display:flex; align-items:flex-start; gap:10px; margin:4px 0; flex-wrap:wrap; }
-    .kw-cat-label { font-size:0.77em; font-weight:bold; color:#666; min-width:175px; flex-shrink:0; padding-top:3px; text-transform:uppercase; letter-spacing:0.03em; }
-    .kw-chips { display:flex; flex-wrap:wrap; gap:4px; }
-    .kw-hit { background:#d5f5e3; color:#1a6b3a; padding:1px 7px; border-radius:4px; font-size:0.75em; }
-    .kw-miss { background:#f0f0f0; color:#bbb; padding:1px 7px; border-radius:4px; font-size:0.75em; }
-    .kw-footer { font-size:0.8em; color:#999; margin:6px 0 0; }
+    body { margin: 0; background: var(--paper); font-family: 'Inter', -apple-system, Segoe UI, Helvetica, Arial, sans-serif; color: var(--ink); }
+
+    .hero { background: linear-gradient(135deg, var(--navy-deep), var(--navy) 60%, #1d4fb0); padding: 30px 40px 34px; color: #fff; }
+    .hero-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 26px; flex-wrap: wrap; gap: 12px; }
+    .brand img { height: 26px; display: block; }
+    .cta { display: flex; gap: 10px; flex-wrap: wrap; }
+    .btn { font-family: 'Inter', sans-serif; font-size: 12.5px; font-weight: 700; padding: 10px 18px; border-radius: 999px; cursor: pointer; border: 1px solid transparent; text-decoration: none; display: inline-block; }
+    .btn-ghost { background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.35); color: #fff; }
+    .btn-ghost:hover { background: rgba(255,255,255,0.2); color: #fff; }
+    .btn-primary { background: linear-gradient(135deg, var(--orange), #f7bb5c); color: #3a2405; box-shadow: 0 6px 16px rgba(246,169,54,0.35); }
+    .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--teal); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+    .eyebrow::before { content: ""; width: 16px; height: 1.5px; background: var(--teal); }
+    .hero h1 { font-family: 'Fraunces', Georgia, serif; font-weight: 600; font-size: 34px; margin: 0 0 16px; letter-spacing: -0.3px; }
+    .chips { display: flex; gap: 9px; flex-wrap: wrap; }
+    .chip { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.18); padding: 7px 13px; border-radius: 9px; font-size: 12px; }
+    .chip b { font-weight: 700; }
+    .chip.warn { background: rgba(245,166,35,0.16); border-color: rgba(245,166,35,0.4); color: #ffe6b8; }
+
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 30px 20px 50px; }
+
+    .dossier { background: #fff; border-radius: 16px; box-shadow: 0 10px 30px -14px rgba(20,40,110,0.18); border: 1px solid var(--line); overflow: hidden; margin-bottom: 26px; }
+    .dossier-body { display: grid; grid-template-columns: 1fr 290px; }
+    .dossier-main { padding: 34px 38px; border-right: 1px solid var(--line); }
+    .dossier-rail { background: var(--cream); padding: 30px 26px; position: relative; }
+    .dossier.is-complete { opacity: 0.6; }
+    .dossier.is-complete .dossier-rail { background: #eef7f5; }
+    .dossier.is-in-progress .dossier-rail { background: #fff8ec; }
+    .rail-icons { position: absolute; top: 16px; right: 16px; display: flex; gap: 6px; z-index: 3; }
+    .icon-btn { background: #fff; border: 1px solid var(--line); color: var(--ink-soft); width: 32px; height: 32px; border-radius: 50%; font-size: 0.95em; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; flex-shrink: 0; }
+    .icon-btn:hover { border-color: var(--amber); color: #8a5a10; }
+    .icon-btn.pin-icon.pinned { background: var(--amber); border-color: var(--amber); color: #3a2405; }
+    .icon-btn.status-icon.in-progress { background: var(--amber); border-color: var(--amber); color: #3a2405; }
+    .icon-btn.status-icon.completed { background: var(--teal); border-color: var(--teal-deep); color: #fff; }
+
+    .status-dd { position: relative; }
+    .status-menu { display: none; position: absolute; top: 38px; right: 0; background: #fff; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 20px -6px rgba(20,40,110,0.25); padding: 6px; z-index: 10; min-width: 140px; }
+    .status-menu.open { display: block; }
+    .status-menu button { display: block; width: 100%; text-align: left; background: none; border: none; padding: 8px 10px; font-family: 'Inter', sans-serif; font-size: 12.5px; font-weight: 600; color: var(--ink); border-radius: 6px; cursor: pointer; }
+    .status-menu button:hover { background: var(--paper); }
+    .status-menu button.active { color: var(--teal-deep); }
+    .status-pill { font-size: 11px; font-weight: 700; padding: 4px 11px; border-radius: 20px; text-transform: uppercase; letter-spacing: 0.3px; white-space: nowrap; }
+    .status-pill.in_progress { background: var(--amber-bg); color: #8a5a10; }
+    .status-pill.completed { background: var(--teal-bg); color: var(--teal-deep); }
+    .status-pill.not_started { background: #f0f0f0; color: #888; }
+
+    .log-form { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
+    .log-input { flex: 1; min-width: 220px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 999px; font-family: 'Inter', sans-serif; font-size: 13px; color: var(--ink); }
+    .log-input:focus { outline: none; border-color: var(--teal); }
+    .log-form .btn { padding: 10px 20px; font-size: 12.5px; }
+
+    .timeline { margin-top: 6px; }
+    .tl-row { display: grid; grid-template-columns: 64px 20px 1fr; gap: 14px; position: relative; padding-bottom: 20px; }
+    .tl-row:last-child { padding-bottom: 0; }
+    .tl-date { text-align: right; font-size: 11.5px; color: var(--ink-soft); line-height: 1.3; padding-top: 3px; }
+    .tl-date .tl-d1 { display: block; font-weight: 600; }
+    .tl-date .tl-d2 { display: block; }
+    .tl-line { position: relative; display: flex; justify-content: center; }
+    .tl-line::before { content: ""; position: absolute; top: 4px; bottom: -20px; width: 2px; background: var(--line); }
+    .tl-row:last-child .tl-line::before { display: none; }
+    .tl-dot { width: 11px; height: 11px; border-radius: 50%; background: var(--ink-soft); margin-top: 3px; z-index: 2; position: relative; }
+    .tl-dot.manual { background: var(--teal); }
+    .tl-dot.auto { background: var(--navy); }
+    .tl-card { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; }
+    .tl-badge { display: inline-block; font-size: 10.5px; font-weight: 700; padding: 3px 9px; border-radius: 20px; margin-bottom: 6px; }
+    .tl-badge.manual { background: var(--teal-bg); color: var(--teal-deep); }
+    .tl-badge.auto { background: var(--blue-bg); color: var(--navy); }
+    .tl-note { margin: 0; font-size: 13.5px; color: #39415a; line-height: 1.5; }
+
+    .d-title { font-family: 'Fraunces', Georgia, serif; font-size: 24px; font-weight: 600; line-height: 1.28; margin: 0 0 20px; color: var(--navy-deep); }
+    .facts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 24px; padding: 18px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin-bottom: 24px; }
+    .fact .k { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--ink-soft); font-weight: 700; margin-bottom: 3px; }
+    .fact .v { font-size: 14.5px; font-weight: 600; }
+    .sec-h { font-size: 11.5px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase; color: var(--ink-soft); margin: 22px 0 12px; }
+    .sec-h:first-of-type { margin-top: 0; }
+    .d-summary { font-size: 14.5px; line-height: 1.65; color: #39415a; margin: 0; }
+    .looking { list-style: none; padding: 0; margin: 0; }
+    .looking li { position: relative; padding: 0 0 0 26px; margin-bottom: 11px; font-size: 14px; line-height: 1.5; color: #39415a; }
+    .looking li::before { content: "✓"; position: absolute; left: 0; top: 0; color: var(--teal-deep); font-weight: 800; }
+    .callout { border-radius: 12px; padding: 16px 18px; margin: 0 0 14px; font-size: 13.8px; line-height: 1.6; }
+    .callout .ct { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 6px; display: flex; align-items: center; gap: 7px; }
+    .c-tip { background: var(--amber-bg); border-left: 3px solid var(--amber); color: #6b4a12; }
+    .c-tip .ct { color: #b4790f; }
+    .c-fit { background: var(--blue-bg); border-left: 3px solid var(--navy); color: #2b3556; }
+    .c-fit .ct { color: var(--navy); }
+    .c-flag { background: var(--red-bg); border-left: 3px solid var(--red); color: #7a2c1e; }
+    .c-flag .ct { color: var(--red); }
+    .c-flag ul { margin: 0; padding-left: 18px; }
+    .c-flag li { margin-bottom: 5px; }
+
+    .rail-score { text-align: center; margin-bottom: 20px; }
+    .ring { position: relative; width: 120px; height: 120px; margin: 0 auto 10px; }
+    .ring svg { transform: rotate(-90deg); width: 100%; height: 100%; }
+    .ring-bg { fill: none; stroke: #dfe3ee; stroke-width: 9; }
+    .ring-fill { fill: none; stroke: var(--teal); stroke-width: 9; stroke-linecap: round; stroke-dasharray: 339.292; }
+    .ring-t { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+    .ring-t .n { font-family: 'Fraunces', Georgia, serif; font-size: 30px; font-weight: 600; color: var(--navy-deep); }
+    .ring-t .l { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--ink-soft); }
+    .rail-fit { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; text-align: center; font-size: 13px; font-weight: 700; color: var(--navy); margin-bottom: 22px; }
+    .rail-fit span { display: block; font-size: 20px; font-family: 'Fraunces', Georgia, serif; margin-top: 2px; }
+    .rail-h { font-size: 11px; font-weight: 800; letter-spacing: 0.8px; text-transform: uppercase; color: var(--ink-soft); margin: 0 0 12px; }
+    .mrow { margin-bottom: 10px; }
+    .mrow .top { display: flex; justify-content: space-between; font-size: 12px; font-weight: 700; margin-bottom: 5px; color: #39415a; }
+    .mrow .top .s { color: var(--teal-deep); }
+    .track { height: 6px; background: #dfe3ee; border-radius: 99px; overflow: hidden; }
+    .fill { height: 100%; background: linear-gradient(90deg, var(--teal), var(--teal-deep)); border-radius: 99px; }
+    .mrow-detail { margin-top: 5px; }
+    .mrow-detail summary { cursor: pointer; font-size: 11px; color: var(--ink-soft); font-weight: 600; list-style: none; }
+    .mrow-detail summary::-webkit-details-marker { display: none; }
+    .mrow-detail summary::before { content: "▸ show matched keywords"; }
+    .mrow-detail[open] summary::before { content: "▾ hide matched keywords"; }
+    .mrow-kw { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+    .kw-pill { background: var(--teal-bg); color: var(--teal-deep); font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 6px; }
+    .kw-pill.miss { background: #f0f0f0; color: #aaa; }
+
+    .rail-meta { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 16px; font-size: 12px; line-height: 1.7; color: var(--ink-soft); }
+    .rail-meta b { color: var(--ink); }
+    .tagset { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .tag { background: var(--teal-bg); color: var(--teal-deep); font-size: 11px; font-weight: 600; padding: 4px 9px; border-radius: 6px; }
+    .sole-tag { background: var(--amber-bg); color: #8a5a10; font-weight: 700; padding: 2px 7px; border-radius: 6px; }
+
+    .rail-actions { margin-top: 22px; display: flex; flex-direction: column; gap: 8px; }
+    .rail-actions .btn { width: 100%; text-align: center; padding: 12px; font-size: 13.5px; }
+    .btn-pin { width: 100%; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 11px; font-size: 13px; background: #fff; border: 1px solid var(--line); color: var(--ink-soft); border-radius: 999px; cursor: pointer; font-family: 'Inter', sans-serif; font-weight: 700; }
+    .btn-pin:hover { border-color: var(--amber); color: #8a5a10; }
+    .btn-pin.pinned { background: var(--amber); border-color: var(--amber); color: #3a2405; }
+    .btn-pin.completed { background: var(--teal); border-color: var(--teal-deep); color: #fff; }
+
+    .no-results { text-align: center; padding: 60px 20px; color: var(--ink-soft); font-size: 1.05em; background: #fff; border-radius: 16px; border: 1px solid var(--line); }
+
+    .footer-bar { background: var(--navy-deep); padding: 18px 32px; display: flex; align-items: center; justify-content: center; gap: 10px; }
+    .footer-bar img { height: 18px; }
+    .footer-bar span { color: rgba(255,255,255,0.6); font-size: 0.76em; letter-spacing: 0.02em; }
+
+    @media (max-width: 720px) {
+      .dossier-body { grid-template-columns: 1fr; }
+      .dossier-main { border-right: none; border-bottom: 1px solid var(--line); }
+      .facts { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <h1>RFP &amp; Grant Opportunities Report</h1>
-  <p class="meta">
-    Generated: <strong>{{ report_date }}</strong> &nbsp;|&nbsp;
-    Company: <strong>{{ company_name }}</strong> &nbsp;|&nbsp;
-    Opportunities shown: <strong>{{ opportunities | length }}</strong>
-  </p>
-
-  {% if opportunities %}
-    {% for opp in opportunities %}
-    <div class="card">
-      <div class="card-header">
-        <p class="title">{{ opp.title or "Untitled Opportunity" }}</p>
-        <span class="score-{% if opp.relevance_score >= 8 %}high{% elif opp.relevance_score >= 5 %}medium{% else %}low{% endif %}">
-          Score: {{ opp.relevance_score }}/10
-        </span>
+  <div class="hero">
+    <div class="hero-top">
+      <div class="brand">{% if logo_data_uri %}<img src="{{ logo_data_uri }}" alt="wellConnected">{% else %}<strong style="color:#fff;font-family:'Fraunces',serif;font-size:1.2em;">wellConnected</strong>{% endif %}</div>
+      <div class="cta">
+        {% if stats_filename %}<a class="btn btn-ghost" href="{{ stats_filename }}" target="_blank" rel="noopener">See the stats</a>{% endif %}
+        <button class="btn btn-ghost" onclick="showPinnedView()">📌 Pinned (<span id="pin-count">0</span>)</button>
+        <button class="btn btn-ghost" onclick="showStatusView()">📋 Status (<span id="status-count">0</span>)</button>
       </div>
-
-      <div class="meta-row">
-        {% if opp.agency_or_funder %}
-        <span><strong>Agency/Funder:</strong> {{ opp.agency_or_funder }}</span>
-        {% endif %}
-        {% if opp.deadline %}
-        <span><strong>Deadline:</strong> {{ opp.deadline }}</span>
-        {% endif %}
-        {% if opp.estimated_value %}
-        <span><strong>Est. Value:</strong> {{ opp.estimated_value }}</span>
-        {% endif %}
-        <span><strong>Source:</strong> {{ opp.source_name }}</span>
-        <span>
-          <strong>Win Likelihood:</strong>
-          <span class="likelihood-{{ opp.win_likelihood }}">{{ opp.win_likelihood | upper }}</span>
-        </span>
-        {% if opp.sole_source_flag %}
-        <span class="sole-source">⚠ Sole Source</span>
-        {% endif %}
-      </div>
-
-      {% if opp.keyword_matches %}
-      <div class="kw-checklist">
-        {% for cat, matches in opp.keyword_matches.items() %}
-        <div class="kw-cat-row">
-          <span class="kw-cat-label">{{ cat }}</span>
-          <div class="kw-chips">
-            {% for kw, hit in matches.items() %}<span class="{{ 'kw-hit' if hit else 'kw-miss' }}">{{ kw }}</span>{% endfor %}
-          </div>
-        </div>
-        {% endfor %}
-        <p class="kw-footer">Optional: {{ opp.optional_keyword_count | default(0) }}/{{ opp.optional_keyword_total | default(0) }} matched &nbsp;&middot;&nbsp; Score: {{ opp.keyword_score | default(0) }}</p>
-      </div>
-      {% endif %}
-
-      {% if opp.summary %}
-      <p class="summary">{{ opp.summary }}</p>
-      {% endif %}
-
-      {% if opp.red_flags %}
-      <div class="red-flags">
-        <strong>Red Flags:</strong>
-        <ul>
-          {% for flag in opp.red_flags %}<li>{{ flag }}</li>{% endfor %}
-        </ul>
-      </div>
-      {% endif %}
-
-      <a class="view-link" href="{{ opp.source_url }}" target="_blank" rel="noopener">View Opportunity →</a>
     </div>
-    {% endfor %}
-  {% else %}
-  <div class="no-results">No opportunities met the criteria for this report period.</div>
-  {% endif %}
+    <div class="eyebrow">Grant Intelligence Report</div>
+    <h1>RFP &amp; Grant Opportunities</h1>
+    <div class="chips">
+      <div class="chip">Generated: <b>{{ report_date }}</b></div>
+      <div class="chip">Company: <b>{{ company_name }}</b></div>
+      <div class="chip">Opportunities: <b>{{ opportunities | length }}</b></div>
+    </div>
+  </div>
+
+  <div id="main-view" class="wrap">
+    {% if opportunities %}
+      {% for opp in opportunities %}
+      <div class="dossier">
+        <div class="dossier-body">
+          <div class="dossier-main">
+            <h2 class="d-title">{{ opp.title or "Untitled Opportunity" }}</h2>
+            <div class="facts">
+              {% if opp.agency_or_funder %}<div class="fact"><div class="k">Agency / Funder</div><div class="v">{{ opp.agency_or_funder }}</div></div>{% endif %}
+              {% if opp.deadline %}<div class="fact"><div class="k">Deadline</div><div class="v">{{ opp.deadline }}</div></div>{% endif %}
+              {% if opp.estimated_value %}<div class="fact"><div class="k">Est. Value</div><div class="v">{{ opp.estimated_value }}</div></div>{% endif %}
+              <div class="fact"><div class="k">Source</div><div class="v">{{ opp.source_name }}</div></div>
+            </div>
+
+            {% if opp.summary %}
+            <div class="sec-h">Summary</div>
+            <p class="d-summary">{{ opp.summary }}</p>
+            {% endif %}
+
+            {% if opp.key_requirements %}
+            <div class="sec-h">What this RFP is looking for</div>
+            <ul class="looking">
+              {% for req in opp.key_requirements %}<li>{{ req }}</li>{% endfor %}
+            </ul>
+            {% endif %}
+
+            {% if opp.win_tip or opp.mission_fit_explanation or opp.red_flags %}<div class="sec-h">&nbsp;</div>{% endif %}
+            {% if opp.win_tip %}
+            <div class="callout c-tip"><div class="ct">💡 Tip to win this RFP</div>{{ opp.win_tip }}</div>
+            {% endif %}
+            {% if opp.mission_fit_explanation %}
+            <div class="callout c-fit"><div class="ct">◆ Why this fits {{ company_name }}</div>{{ opp.mission_fit_explanation }}</div>
+            {% endif %}
+            {% if opp.red_flags %}
+            <div class="callout c-flag"><div class="ct">⚠ Red flags</div><ul>{% for flag in opp.red_flags %}<li>{{ flag }}</li>{% endfor %}</ul></div>
+            {% endif %}
+          </div>
+
+          <aside class="dossier-rail">
+            <div class="rail-icons">
+              <button class="icon-btn pin-icon" data-opp="{{ opp.pin_payload }}" onclick="togglePin(this)" title="Pin this RFP" aria-label="Pin this RFP">📌</button>
+              <div class="status-dd">
+                <button class="icon-btn status-icon" data-opp="{{ opp.pin_payload }}" onclick="toggleStatusMenu(this)" title="Set status" aria-label="Set status">○</button>
+                <div class="status-menu">
+                  <button onclick="setStatusFromMenu(this,'not_started')">Not Started</button>
+                  <button onclick="setStatusFromMenu(this,'in_progress')">In Progress</button>
+                  <button onclick="setStatusFromMenu(this,'completed')">Completed</button>
+                </div>
+              </div>
+            </div>
+            <div class="rail-score">
+              <div class="ring">
+                <svg viewBox="0 0 120 120"><circle class="ring-bg" cx="60" cy="60" r="54"/><circle class="ring-fill" cx="60" cy="60" r="54" style="stroke-dashoffset:{{ opp.score_ring_offset }}"/></svg>
+                <div class="ring-t"><div class="n">{{ opp.relevance_score }}/10</div><div class="l">Score</div></div>
+              </div>
+            </div>
+            {% if opp.mission_alignment_score %}
+            <div class="rail-fit">Mission Fit<span>{{ opp.mission_alignment_score }}/10</span></div>
+            {% endif %}
+
+            {% if opp.keyword_hits %}
+            <div class="rail-h">Match breakdown</div>
+            {% for cat, info in opp.keyword_hits.items() %}
+            <div class="mrow">
+              <div class="top"><span>{{ info.label }}</span><span class="s">{{ info.matched | length }}/{{ info.total }}</span></div>
+              <div class="track"><div class="fill" style="width:{{ info.pct }}%"></div></div>
+              <details class="mrow-detail">
+                <summary></summary>
+                <div class="mrow-kw">
+                  {% if info.matched %}
+                    {% for kw in info.matched %}<span class="kw-pill">{{ kw }}</span>{% endfor %}
+                  {% else %}
+                    <span class="kw-pill miss">no matches</span>
+                  {% endif %}
+                </div>
+              </details>
+            </div>
+            {% endfor %}
+            {% endif %}
+
+            <div class="rail-meta">
+              <b>Win likelihood:</b> {{ opp.win_likelihood | capitalize }}{% if opp.sole_source_flag %} &middot; <span class="sole-tag">Sole source</span>{% endif %}
+              {% if opp.optional_matched_flat %}
+              <br><b>Optional matches</b>
+              <div class="tagset">{% for kw in opp.optional_matched_flat %}<span class="tag">{{ kw }}</span>{% endfor %}</div>
+              {% endif %}
+            </div>
+
+            <div class="rail-actions">
+              <a class="btn btn-primary" href="{{ opp.source_url }}" target="_blank" rel="noopener">View opportunity →</a>
+            </div>
+          </aside>
+        </div>
+      </div>
+      {% endfor %}
+    {% else %}
+    <div class="no-results">No opportunities met the criteria for this report period.</div>
+    {% endif %}
+  </div>
+
+  <div id="pinned-view" class="wrap" style="display:none;">
+    <button class="btn btn-primary" style="margin-bottom:22px;" onclick="showMainView()">← Back to report</button>
+    <div id="pinned-empty" class="no-results">No pinned RFPs yet. Click the 📌 icon on any opportunity to save it here.</div>
+    <div id="pinned-list"></div>
+  </div>
+
+  <div id="status-view" class="wrap" style="display:none;">
+    <button class="btn btn-primary" style="margin-bottom:22px;" onclick="showMainView()">← Back to report</button>
+    <div id="status-empty" class="no-results">No tracked RFPs yet. Set an RFP's status to "In Progress" or "Completed" to start tracking it here.</div>
+    <div id="status-list"></div>
+  </div>
+
+  <div class="footer-bar">
+    {% if footer_logo_data_uri %}<img src="{{ footer_logo_data_uri }}" alt="wellConnected">{% endif %}
+    <span>Powered by wellConnected</span>
+  </div>
+
+  <script>
+    const PIN_KEY = 'wellconnected_pinned_rfps';
+    const STATUS_KEY = 'wellconnected_rfp_status';
+    const STATUS_LABELS = { not_started: 'Not Started', in_progress: 'In Progress', completed: 'Completed' };
+
+    // In-memory fallback so pin/status still work for the current page session
+    // even if the browser blocks localStorage for local file:// pages (some do).
+    let _pinnedCache = null;
+    function getPinned() {
+      if (_pinnedCache) return _pinnedCache;
+      try { _pinnedCache = JSON.parse(localStorage.getItem(PIN_KEY) || '[]'); } catch (e) { _pinnedCache = []; }
+      return _pinnedCache;
+    }
+    function savePinned(list) {
+      _pinnedCache = list;
+      try { localStorage.setItem(PIN_KEY, JSON.stringify(list)); } catch (e) { /* session-only persistence */ }
+    }
+    function isPinned(url) {
+      return getPinned().some(function (o) { return o.source_url === url; });
+    }
+
+    let _statusCache = null;
+    function getStatusMap() {
+      if (_statusCache) return _statusCache;
+      try { _statusCache = JSON.parse(localStorage.getItem(STATUS_KEY) || '{}'); } catch (e) { _statusCache = {}; }
+      return _statusCache;
+    }
+    function saveStatusMap(map) {
+      _statusCache = map;
+      try { localStorage.setItem(STATUS_KEY, JSON.stringify(map)); } catch (e) { /* session-only persistence */ }
+    }
+    function getStatusRecord(url) {
+      return getStatusMap()[url] || null;
+    }
+
+    // Setting status back to "Not Started" clears tracking for that RFP entirely
+    // (including its logged history) — treated as a deliberate reset.
+    function setStatus(url, opp, status) {
+      const map = getStatusMap();
+      const existing = map[url];
+      const prevStatus = existing ? existing.status : 'not_started';
+      if (status === 'not_started') {
+        delete map[url];
+        saveStatusMap(map);
+        return;
+      }
+      const record = existing || { opp: opp, log: [] };
+      record.opp = opp;
+      record.status = status;
+      if (status !== prevStatus) {
+        record.log.push({ note: 'Status changed to ' + STATUS_LABELS[status], at: new Date().toISOString(), auto: true });
+      }
+      map[url] = record;
+      saveStatusMap(map);
+    }
+
+    function addStageLog(url, note) {
+      const map = getStatusMap();
+      const record = map[url];
+      if (!record) return;
+      record.log.push({ note: note, at: new Date().toISOString(), auto: false });
+      map[url] = record;
+      saveStatusMap(map);
+      renderStatusTab();
+    }
+
+    function setPinBtnState(btn, pinned) {
+      btn.classList.toggle('pinned', pinned);
+      btn.title = pinned ? 'Unpin this RFP' : 'Pin this RFP';
+      const label = btn.querySelector('.pin-label');
+      if (label) label.textContent = pinned ? 'Pinned' : 'Pin this RFP';
+    }
+
+    function statusGlyph(status) {
+      if (status === 'in_progress') return '⏳';
+      if (status === 'completed') return '✓';
+      return '○';
+    }
+
+    function updateStatusIcon(btn, status) {
+      btn.classList.remove('in-progress', 'completed');
+      if (status === 'in_progress') btn.classList.add('in-progress');
+      else if (status === 'completed') btn.classList.add('completed');
+      btn.textContent = statusGlyph(status);
+      btn.title = STATUS_LABELS[status] || STATUS_LABELS.not_started;
+    }
+
+    // Cards get tagged with their original position on load so status changes
+    // that move them can restore them to where they were instead of leaving
+    // them stranded out of order.
+    function reinsertInOrder(card) {
+      const container = card.parentNode;
+      if (!container) return;
+      const order = parseInt(card.dataset.order || '0', 10);
+      const siblings = Array.from(container.querySelectorAll(':scope > .dossier'));
+      let target = null;
+      for (const sib of siblings) {
+        if (sib === card) continue;
+        if (parseInt(sib.dataset.order || '0', 10) > order) { target = sib; break; }
+      }
+      if (target) container.insertBefore(card, target);
+      else container.appendChild(card);
+    }
+
+    function togglePin(btn) {
+      const opp = JSON.parse(btn.getAttribute('data-opp'));
+      const list = getPinned();
+      const idx = list.findIndex(function (o) { return o.source_url === opp.source_url; });
+      if (idx >= 0) {
+        list.splice(idx, 1);
+        setPinBtnState(btn, false);
+      } else {
+        opp.pinned_at = new Date().toISOString();
+        list.push(opp);
+        setPinBtnState(btn, true);
+      }
+      savePinned(list);
+      renderPinned();
+    }
+
+    function unpin(sourceUrl) {
+      savePinned(getPinned().filter(function (o) { return o.source_url !== sourceUrl; }));
+      renderPinned();
+      document.querySelectorAll('.pin-icon[data-opp]').forEach(function (btn) {
+        const opp = JSON.parse(btn.getAttribute('data-opp'));
+        if (opp.source_url === sourceUrl) setPinBtnState(btn, false);
+      });
+    }
+
+    function unpinFromCard(btn) {
+      unpin(btn.getAttribute('data-url'));
+    }
+
+    function closeAllStatusMenus() {
+      document.querySelectorAll('.status-menu.open').forEach(function (m) { m.classList.remove('open'); });
+    }
+    document.addEventListener('click', function (e) {
+      if (!e.target.closest('.status-dd')) closeAllStatusMenus();
+    });
+
+    function toggleStatusMenu(btn) {
+      const menu = btn.nextElementSibling;
+      const isOpen = menu.classList.contains('open');
+      closeAllStatusMenus();
+      if (!isOpen) menu.classList.add('open');
+    }
+
+    function setStatusFromMenu(menuBtn, status) {
+      const dd = menuBtn.closest('.status-dd');
+      const icon = dd.querySelector('.status-icon');
+      const opp = JSON.parse(icon.getAttribute('data-opp'));
+      applyStatus(opp, status);
+      closeAllStatusMenus();
+    }
+
+    // Applies a status change and syncs every status-icon on the page that refers
+    // to this RFP (there can be one in the main list and one in the Status tab).
+    function applyStatus(opp, status) {
+      setStatus(opp.source_url, opp, status);
+      document.querySelectorAll('.status-icon[data-opp]').forEach(function (btn) {
+        let btnOpp;
+        try { btnOpp = JSON.parse(btn.getAttribute('data-opp')); } catch (e) { return; }
+        if (btnOpp.source_url !== opp.source_url) return;
+        updateStatusIcon(btn, status);
+        const card = btn.closest('.dossier');
+        if (card && card.closest('#main-view')) {
+          card.classList.toggle('is-complete', status === 'completed');
+          card.classList.toggle('is-in-progress', status === 'in_progress');
+          if (status === 'completed' && card.parentNode) card.parentNode.appendChild(card);
+          else reinsertInOrder(card);
+        }
+      });
+      renderStatusTab();
+    }
+
+    function submitLog(btn) {
+      const wrap = btn.closest('.dossier[data-url]');
+      if (!wrap) return;
+      const url = wrap.getAttribute('data-url');
+      const input = wrap.querySelector('.log-input');
+      const note = input.value.trim();
+      if (!note) return;
+      addStageLog(url, note);
+    }
+
+    function escapeHtml(str) {
+      return String(str == null ? '' : str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function miniDossierHtml(opp, actionsHtml) {
+      let html = '<div class="dossier"><div class="dossier-main" style="border-right:none;">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:8px;">';
+      html += '<h2 class="d-title" style="margin:0;">' + escapeHtml(opp.title || 'Untitled Opportunity') + '</h2>';
+      html += '<div style="display:flex;gap:8px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;">';
+      html += '<span class="chip" style="background:var(--teal-bg);color:var(--teal-deep);border:none;">Score: ' + (opp.relevance_score || 0) + '/10</span>';
+      if (opp.mission_alignment_score) {
+        html += '<span class="chip" style="background:var(--blue-bg);color:var(--navy);border:none;">Fit: ' + opp.mission_alignment_score + '/10</span>';
+      }
+      html += '</div></div>';
+      html += '<div class="facts">';
+      if (opp.agency_or_funder) html += '<div class="fact"><div class="k">Agency / Funder</div><div class="v">' + escapeHtml(opp.agency_or_funder) + '</div></div>';
+      if (opp.deadline) html += '<div class="fact"><div class="k">Deadline</div><div class="v">' + escapeHtml(opp.deadline) + '</div></div>';
+      if (opp.estimated_value) html += '<div class="fact"><div class="k">Est. Value</div><div class="v">' + escapeHtml(opp.estimated_value) + '</div></div>';
+      html += '</div>';
+      if (opp.summary) html += '<div class="sec-h">Summary</div><p class="d-summary">' + escapeHtml(opp.summary) + '</p>';
+      if (opp.key_requirements && opp.key_requirements.length) {
+        html += '<div class="sec-h">What this RFP is looking for</div><ul class="looking">';
+        opp.key_requirements.forEach(function (req) { html += '<li>' + escapeHtml(req) + '</li>'; });
+        html += '</ul>';
+      }
+      if (opp.win_tip) html += '<div class="callout c-tip"><div class="ct">💡 Tip to win this RFP</div>' + escapeHtml(opp.win_tip) + '</div>';
+      if (opp.mission_fit_explanation) html += '<div class="callout c-fit"><div class="ct">◆ Why this fits {{ company_name }}</div>' + escapeHtml(opp.mission_fit_explanation) + '</div>';
+      html += '<div style="display:flex;gap:10px;margin-top:20px;flex-wrap:wrap;">' + actionsHtml + '</div>';
+      html += '</div></div>';
+      return html;
+    }
+
+    function pinnedCardHtml(opp) {
+      const actions = '<button class="btn-pin pinned" data-url="' + escapeHtml(opp.source_url) + '" onclick="unpinFromCard(this)" title="Unpin this RFP"><span>📌</span><span class="pin-label">Pinned</span></button>' +
+        '<a class="btn btn-primary" href="' + escapeHtml(opp.source_url) + '" target="_blank" rel="noopener">View opportunity →</a>';
+      return miniDossierHtml(opp, actions);
+    }
+
+    function renderPinned() {
+      const list = getPinned();
+      const container = document.getElementById('pinned-list');
+      const emptyMsg = document.getElementById('pinned-empty');
+      container.innerHTML = list.slice().reverse().map(pinnedCardHtml).join('');
+      emptyMsg.style.display = list.length ? 'none' : 'block';
+      document.getElementById('pin-count').textContent = list.length;
+    }
+
+    function statusDropdownHtml(opp, currentStatus) {
+      const payload = escapeHtml(JSON.stringify(opp));
+      const cls = currentStatus === 'in_progress' ? ' in-progress' : (currentStatus === 'completed' ? ' completed' : '');
+      let html = '<div class="status-dd">';
+      html += '<button class="icon-btn status-icon' + cls + '" data-opp="' + payload + '" onclick="toggleStatusMenu(this)" title="' + STATUS_LABELS[currentStatus || 'not_started'] + '">' + statusGlyph(currentStatus) + '</button>';
+      html += '<div class="status-menu">';
+      ['not_started', 'in_progress', 'completed'].forEach(function (s) {
+        html += '<button class="' + (s === (currentStatus || 'not_started') ? 'active' : '') + '" onclick="setStatusFromMenu(this,\\'' + s + '\\')">' + STATUS_LABELS[s] + '</button>';
+      });
+      html += '</div></div>';
+      return html;
+    }
+
+    function formatTlDate(iso) {
+      const d = new Date(iso);
+      if (isNaN(d)) return { d1: '', d2: '' };
+      return {
+        d1: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+        d2: String(d.getFullYear()),
+      };
+    }
+
+    function timelineHtml(log) {
+      if (!log || !log.length) return '<p style="font-size:12.5px;color:var(--ink-soft);">No updates logged yet.</p>';
+      return log.map(function (entry) {
+        const dt = formatTlDate(entry.at);
+        const cls = entry.auto ? 'auto' : 'manual';
+        const badgeLabel = entry.auto ? '● Status Update' : '📝 Progress Note';
+        return '<div class="tl-row">' +
+          '<div class="tl-date"><span class="tl-d1">' + dt.d1 + '</span><span class="tl-d2">' + dt.d2 + '</span></div>' +
+          '<div class="tl-line"><span class="tl-dot ' + cls + '"></span></div>' +
+          '<div class="tl-card"><span class="tl-badge ' + cls + '">' + badgeLabel + '</span><p class="tl-note">' + escapeHtml(entry.note) + '</p></div>' +
+          '</div>';
+      }).join('');
+    }
+
+    function statusEntryHtml(url, record) {
+      const opp = record.opp;
+      let html = '<div class="dossier" data-url="' + escapeHtml(url) + '" style="margin-bottom:26px;">';
+      html += '<div class="dossier-main" style="border-right:none;">';
+      html += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:8px;flex-wrap:wrap;">';
+      html += '<h2 class="d-title" style="margin:0;">' + escapeHtml(opp.title || 'Untitled Opportunity') + '</h2>';
+      html += '<div style="display:flex;gap:8px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;align-items:center;">';
+      html += '<span class="status-pill ' + record.status + '">' + STATUS_LABELS[record.status] + '</span>';
+      html += statusDropdownHtml(opp, record.status);
+      html += '</div></div>';
+      html += '<div class="facts">';
+      if (opp.agency_or_funder) html += '<div class="fact"><div class="k">Agency / Funder</div><div class="v">' + escapeHtml(opp.agency_or_funder) + '</div></div>';
+      if (opp.deadline) html += '<div class="fact"><div class="k">Deadline</div><div class="v">' + escapeHtml(opp.deadline) + '</div></div>';
+      if (opp.estimated_value) html += '<div class="fact"><div class="k">Est. Value</div><div class="v">' + escapeHtml(opp.estimated_value) + '</div></div>';
+      html += '</div>';
+      if (record.status === 'in_progress') {
+        html += '<div class="sec-h">Log an update</div>';
+        html += '<div class="log-form">';
+        html += '<input type="text" class="log-input" placeholder="What stage/process are you on?" onkeydown="if(event.key===\\'Enter\\'){event.preventDefault();this.nextElementSibling.click();}">';
+        html += '<button class="btn btn-primary" onclick="submitLog(this)">Log Update</button>';
+        html += '</div>';
+      }
+      html += '<div class="sec-h">Timeline</div>';
+      html += '<div class="timeline">' + timelineHtml(record.log) + '</div>';
+      html += '<div style="margin-top:18px;"><a class="btn btn-primary" href="' + escapeHtml(opp.source_url) + '" target="_blank" rel="noopener">View opportunity →</a></div>';
+      html += '</div></div>';
+      return html;
+    }
+
+    function renderStatusTab() {
+      const map = getStatusMap();
+      const urls = Object.keys(map);
+      const container = document.getElementById('status-list');
+      const emptyMsg = document.getElementById('status-empty');
+      urls.sort(function (a, b) {
+        const la = map[a].log[map[a].log.length - 1];
+        const lb = map[b].log[map[b].log.length - 1];
+        return new Date(lb ? lb.at : 0) - new Date(la ? la.at : 0);
+      });
+      container.innerHTML = urls.map(function (u) { return statusEntryHtml(u, map[u]); }).join('');
+      emptyMsg.style.display = urls.length ? 'none' : 'block';
+      document.getElementById('status-count').textContent = urls.length;
+    }
+
+    function showPinnedView() {
+      document.getElementById('main-view').style.display = 'none';
+      document.getElementById('status-view').style.display = 'none';
+      document.getElementById('pinned-view').style.display = 'block';
+    }
+    function showStatusView() {
+      document.getElementById('main-view').style.display = 'none';
+      document.getElementById('pinned-view').style.display = 'none';
+      document.getElementById('status-view').style.display = 'block';
+    }
+    function showMainView() {
+      document.getElementById('pinned-view').style.display = 'none';
+      document.getElementById('status-view').style.display = 'none';
+      document.getElementById('main-view').style.display = 'block';
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+      document.querySelectorAll('#main-view .dossier').forEach(function (card, i) {
+        card.dataset.order = i;
+      });
+      document.querySelectorAll('.pin-icon[data-opp]').forEach(function (btn) {
+        const opp = JSON.parse(btn.getAttribute('data-opp'));
+        if (isPinned(opp.source_url)) setPinBtnState(btn, true);
+      });
+      document.querySelectorAll('.status-icon[data-opp]').forEach(function (btn) {
+        const opp = JSON.parse(btn.getAttribute('data-opp'));
+        const rec = getStatusRecord(opp.source_url);
+        const status = rec ? rec.status : 'not_started';
+        updateStatusIcon(btn, status);
+        const card = btn.closest('.dossier');
+        if (status !== 'not_started' && card && card.parentNode) {
+          card.classList.toggle('is-complete', status === 'completed');
+          card.classList.toggle('is-in-progress', status === 'in_progress');
+          if (status === 'completed') card.parentNode.appendChild(card);
+        }
+      });
+      renderPinned();
+      renderStatusTab();
+    });
+  </script>
 </body>
 </html>
 """
 
 
-def generate_report(opportunities: list[dict], config: dict) -> str:
+def generate_report(opportunities: list[dict], config: dict, stats_filename: str = "") -> str:
     logger.info("=== STAGE: REPORT GENERATION ===")
 
     report_cfg = config.get("output", {}).get("report", {})
@@ -751,26 +1414,75 @@ def generate_report(opportunities: list[dict], config: dict) -> str:
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
+    # Rank by relevance first, but let strong mission fit break ties/nudge order —
+    # a genuinely mission-aligned RFP should surface even if its raw relevance score is close.
     sorted_opps = sorted(
-        opportunities, key=lambda x: x.get("relevance_score", 0), reverse=True
+        opportunities,
+        key=lambda x: (x.get("relevance_score", 0), x.get("mission_alignment_score", 0)),
+        reverse=True,
     )[:max_opps]
 
-    # Deserialize red_flags that were round-tripped through the DB as JSON strings
+    # Deserialize fields that were round-tripped through the DB as JSON strings
     for opp in sorted_opps:
         if isinstance(opp.get("red_flags"), str):
             try:
                 opp["red_flags"] = json.loads(opp["red_flags"])
             except (json.JSONDecodeError, TypeError):
                 opp["red_flags"] = []
+        if isinstance(opp.get("key_requirements"), str):
+            try:
+                opp["key_requirements"] = json.loads(opp["key_requirements"])
+            except (json.JSONDecodeError, TypeError):
+                opp["key_requirements"] = []
+
+        # Precompute display-only shapes so the template only shows matched keywords.
+        opp["keyword_hits"] = {}
+        for cat, matches in (opp.get("keyword_matches") or {}).items():
+            matched = [kw for kw, hit in matches.items() if hit]
+            total = len(matches)
+            opp["keyword_hits"][cat] = {
+                "matched": matched,
+                "total": total,
+                "pct": round(100 * len(matched) / total) if total else 0,
+                "label": cat.replace("&", " & ").replace("_", " ").title(),
+            }
+        opp["optional_matched_flat"] = [
+            kw for kws in (opp.get("optional_keyword_matches") or {}).values() for kw in kws
+        ]
+
+        # Ring-chart stroke-dashoffset for a circle of radius 54 (circumference ≈ 339.292).
+        score = min(10, max(0, opp.get("relevance_score", 0) or 0))
+        opp["score_ring_offset"] = round(339.292 * (1 - score / 10), 1)
+
+        # Payload embedded in the pin button so a pinned RFP can be re-rendered client-side
+        # (via localStorage) without needing the full pipeline dataset around.
+        pin_data = {
+            "title": opp.get("title", ""),
+            "source_url": opp.get("source_url", ""),
+            "agency_or_funder": opp.get("agency_or_funder", ""),
+            "deadline": opp.get("deadline", ""),
+            "estimated_value": opp.get("estimated_value", ""),
+            "source_name": opp.get("source_name", ""),
+            "relevance_score": opp.get("relevance_score", 0),
+            "mission_alignment_score": opp.get("mission_alignment_score", 0),
+            "keyword_score": opp.get("keyword_score", 0),
+            "summary": opp.get("summary", ""),
+            "mission_fit_explanation": opp.get("mission_fit_explanation", ""),
+            "win_tip": opp.get("win_tip", ""),
+            "key_requirements": opp.get("key_requirements", []),
+        }
+        opp["pin_payload"] = _escape_for_html_attr(json.dumps(pin_data))
 
     report_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-    datestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = os.path.join(output_dir, f"report_{datestamp}.html")
+    filepath = os.path.join(output_dir, "report.html")
 
     html = Template(_HTML_TEMPLATE).render(
         opportunities=sorted_opps,
         report_date=report_date,
         company_name=company_name,
+        stats_filename=stats_filename,
+        logo_data_uri=_encode_asset_data_uri("assets/wellconnected-footer.png"),
+        footer_logo_data_uri=_encode_asset_data_uri("assets/wellconnected-footer.png"),
     )
 
     with open(filepath, "w", encoding="utf-8") as f:
@@ -825,29 +1537,55 @@ _DEBUG_TEMPLATE = """<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RFP Keyword Scorer — Debug View</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,500;0,600;1,500&family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
+    :root {
+      --primary: #1648AF;   /* brand navy */
+      --hero-blue: #1747B0; /* login-page hero */
+      --teal: #1CBBAD;      /* secondary — logo bowl */
+      --gold: #FFC252;      /* accent — CTA gold */
+      --sky: #1FB8FF;       /* bright accent — checkmarks, borders */
+      --sky-light: #47C5FF;
+      --error: #FF5722;     /* reserved for rejected / error states */
+      --slate: #2C3E50;
+      --offwhite: #F9F9F9;
+    }
     * { box-sizing: border-box; }
-    body { font-family: Arial, sans-serif; background: #fff; color: #222; max-width: 1500px; margin: 0 auto; padding: 32px 24px; }
-    h1 { color: #1a2638; border-bottom: 3px solid #2e86de; padding-bottom: 10px; margin-bottom: 6px; }
-    h2 { color: #1a2638; font-size: 1.1em; margin: 28px 0 12px; }
-    .subtitle { color: #666; font-size: 0.9em; margin-bottom: 32px; }
-    .summary-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 36px; }
-    .stat { background: #f4f6f8; border-radius: 8px; padding: 16px 24px; text-align: center; min-width: 150px; }
-    .stat .num { font-size: 2.2em; font-weight: bold; color: #1a2638; line-height: 1.1; }
-    .stat .lbl { font-size: 0.8em; color: #666; margin-top: 4px; }
-    .excl-table { width: 100%; border-collapse: collapse; font-size: 0.85em; margin-bottom: 36px; }
-    .excl-table th { background: #c0392b; color: #fff; padding: 8px 12px; text-align: left; }
+    body { font-family: 'Poppins', -apple-system, Segoe UI, Helvetica, Arial, sans-serif; background: var(--offwhite); color: var(--slate); margin: 0; padding: 0 0 60px; }
+
+    .navbar { background: var(--primary); padding: 14px 32px; display: flex; align-items: center; justify-content: space-between; }
+    .navbar-logo { height: 32px; display: block; }
+    .navbar-badge { color: var(--sky-light); border: 1px solid rgba(71,197,255,0.55); border-radius: 20px; padding: 5px 16px; font-size: 0.72em; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
+
+    .hero { background: var(--hero-blue); color: #fff; padding: 36px 32px 30px; }
+    .hero h1 { font-family: 'Lora', Georgia, serif; font-weight: 500; font-size: 1.9em; margin: 0 0 8px; }
+    .hero .subtitle { color: rgba(255,255,255,0.82); font-size: 0.92em; margin: 0; }
+    .hero .subtitle strong { color: #fff; }
+
+    .content { max-width: 1500px; margin: 0 auto; padding: 32px 24px 0; }
+
+    h2 { font-family: 'Lora', Georgia, serif; font-weight: 600; color: var(--primary); font-size: 1.15em; margin: 34px 0 14px; }
+
+    .summary-row { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 12px; }
+    .stat { background: #fff; border: 1px solid #e3e6ea; border-radius: 0 28px 0 28px; padding: 18px 26px; text-align: center; min-width: 160px; border-top: 3px solid var(--teal); }
+    .stat .num { font-family: 'Lora', Georgia, serif; font-size: 2.1em; font-weight: 600; color: var(--primary); line-height: 1.1; }
+    .stat .lbl { font-size: 0.78em; color: #667; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.03em; }
+
+    .excl-table { width: 100%; border-collapse: collapse; font-size: 0.85em; margin-bottom: 36px; background: #fff; }
+    .excl-table th { background: var(--error); color: #fff; padding: 8px 12px; text-align: left; font-weight: 600; }
     .excl-table td { padding: 7px 12px; border-bottom: 1px solid #eee; }
-    .excl-table tr:nth-child(even) { background: #fdf5f5; }
-    .table-wrap { overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.84em; }
-    thead th { background: #1a2638; color: #fff; padding: 10px 14px; text-align: left; white-space: nowrap; }
-    tbody tr:nth-child(even) { background: #fafafa; }
-    tbody tr:hover { background: #f0f5ff; }
+    .excl-table tr:nth-child(even) { background: #fff6f3; }
+
+    .table-wrap { overflow-x: auto; border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.84em; background: #fff; }
+    thead th { background: var(--primary); color: #fff; padding: 10px 14px; text-align: left; white-space: nowrap; font-weight: 600; }
+    tbody tr:nth-child(even) { background: #fafbfd; }
+    tbody tr:hover { background: #eef6ff; }
     td { padding: 9px 14px; vertical-align: top; border-bottom: 1px solid #eee; }
-    .score-cell { font-weight: bold; font-size: 1.05em; white-space: nowrap; }
-    .score-hi { color: #1a6b3a; }
-    .score-mid { color: #856404; }
+    .score-cell { font-weight: 700; font-size: 1.05em; white-space: nowrap; }
+    .score-hi { color: #128f83; }
+    .score-mid { color: #a67312; }
     .score-lo { color: #aaa; }
     .title-cell { font-weight: 600; max-width: 220px; word-break: break-word; }
     .url-cell { max-width: 140px; word-break: break-all; font-size: 0.8em; }
@@ -855,85 +1593,123 @@ _DEBUG_TEMPLATE = """<!DOCTYPE html>
     .kw-cat-row { display: flex; align-items: flex-start; gap: 8px; margin: 3px 0; flex-wrap: wrap; }
     .kw-cat-label { font-size: 0.72em; font-weight: bold; color: #777; min-width: 160px; flex-shrink: 0; padding-top: 2px; text-transform: uppercase; letter-spacing: 0.03em; }
     .kw-chips { display: flex; flex-wrap: wrap; gap: 3px; }
-    .kw-hit { background: #d5f5e3; color: #1a6b3a; padding: 1px 6px; border-radius: 4px; font-size: 0.74em; }
+    .kw-hit { background: #dff6f4; color: #128f83; padding: 1px 6px; border-radius: 4px; font-size: 0.74em; font-weight: 600; }
+    .kw-hit::before { content: "✓ "; color: var(--sky); }
     .kw-miss { background: #f0f0f0; color: #bbb; padding: 1px 6px; border-radius: 4px; font-size: 0.74em; }
     .opt-line { font-size: 0.78em; color: #999; margin-top: 4px; }
-    a { color: #2e86de; text-decoration: none; }
-    a:hover { text-decoration: underline; }
+    a { color: var(--primary); text-decoration: none; }
+    a:hover { color: var(--teal); text-decoration: underline; }
+
+    .footer-bar { background: var(--primary); margin-top: 48px; padding: 18px 32px; display: flex; align-items: center; justify-content: center; gap: 10px; }
+    .footer-bar img { height: 20px; }
+    .footer-bar span { color: rgba(255,255,255,0.75); font-size: 0.78em; letter-spacing: 0.02em; }
   </style>
 </head>
 <body>
-  <h1>RFP Keyword Scorer — Debug View</h1>
-  <p class="subtitle">Generated: <strong>{{ report_date }}</strong> &nbsp;&middot;&nbsp; All non-excluded RFPs ranked by keyword score. Use this to tune keywords in config.json.</p>
-
-  <div class="summary-row">
-    <div class="stat"><div class="num">{{ total_scraped }}</div><div class="lbl">Total Scraped</div></div>
-    <div class="stat"><div class="num">{{ excluded_count }}</div><div class="lbl">Excluded (hard reject)</div></div>
-    <div class="stat"><div class="num">{{ scored_count }}</div><div class="lbl">Scored &amp; Ranked</div></div>
+  <div class="navbar">
+    {% if logo_data_uri %}<img class="navbar-logo" src="{{ logo_data_uri }}" alt="allco">{% else %}<strong style="color:#fff;font-family:'Lora',serif;font-size:1.3em;">allco</strong>{% endif %}
+    <span class="navbar-badge">Internal Tool &middot; Debug View</span>
   </div>
 
-  {% if excluded %}
-  <h2>Excluded by Keyword ({{ excluded | length }})</h2>
-  <table class="excl-table">
-    <thead><tr><th>#</th><th>Title</th><th>Triggered Keyword</th><th>URL</th></tr></thead>
-    <tbody>
-      {% for r in excluded %}
-      <tr>
-        <td>{{ loop.index }}</td>
-        <td>{{ r.title or "(no title)" }}</td>
-        <td><strong>{{ r.triggered_keyword }}</strong></td>
-        <td><a href="{{ r.url }}" target="_blank" rel="noopener">{{ r.url[:60] }}{% if r.url | length > 60 %}&hellip;{% endif %}</a></td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {% endif %}
+  <div class="hero">
+    <h1>RFP Keyword Scorer</h1>
+    <p class="subtitle">Generated: <strong>{{ report_date }}</strong> &nbsp;&middot;&nbsp; All non-excluded RFPs ranked by keyword score. Use this to tune keywords in config.json.</p>
+  </div>
 
-  <h2>Scored &amp; Ranked ({{ scored | length }}) — highest keyword overlap first</h2>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Rank</th>
-          <th>Score</th>
-          <th>Title</th>
-          <th>URL</th>
-          <th>Keyword Matches by Category</th>
-        </tr>
-      </thead>
+  <div class="content">
+    <div class="summary-row">
+      <div class="stat"><div class="num">{{ total_scraped }}</div><div class="lbl">Total Scraped</div></div>
+      <div class="stat"><div class="num">{{ excluded_count }}</div><div class="lbl">Excluded (hard reject)</div></div>
+      <div class="stat"><div class="num">{{ scored_count }}</div><div class="lbl">Scored &amp; Ranked</div></div>
+    </div>
+
+    {% if excluded %}
+    <h2>Excluded by Keyword ({{ excluded | length }})</h2>
+    <table class="excl-table">
+      <thead><tr><th>#</th><th>Title</th><th>Triggered Keyword</th><th>URL</th></tr></thead>
       <tbody>
-        {% for opp in scored %}
-        {% set s = opp.keyword_score | default(0) %}
+        {% for r in excluded %}
         <tr>
           <td>{{ loop.index }}</td>
-          <td class="score-cell {{ 'score-hi' if s >= 0.1 else ('score-mid' if s >= 0.03 else 'score-lo') }}">{{ "%.3f"|format(s) }}</td>
-          <td class="title-cell">{{ opp.title or "(no title)" }}</td>
-          <td class="url-cell">{% if opp.source_url %}<a href="{{ opp.source_url }}" target="_blank" rel="noopener">{{ opp.source_url[:55] }}{% if opp.source_url | length > 55 %}&hellip;{% endif %}</a>{% else %}&mdash;{% endif %}</td>
-          <td>
-            <div class="kw-section">
-              {% for cat, matches in opp.keyword_matches.items() %}
-              <div class="kw-cat-row">
-                <span class="kw-cat-label">{{ cat }}</span>
-                <div class="kw-chips">
-                  {% for kw, hit in matches.items() %}<span class="{{ 'kw-hit' if hit else 'kw-miss' }}">{{ kw }}</span>{% endfor %}
-                </div>
-              </div>
-              {% endfor %}
-              <p class="opt-line">Optional: {{ opp.optional_keyword_count | default(0) }}/{{ opp.optional_keyword_total | default(0) }} matched</p>
-            </div>
-          </td>
+          <td>{{ r.title or "(no title)" }}</td>
+          <td><strong>{{ r.triggered_keyword }}</strong></td>
+          <td><a href="{{ r.url }}" target="_blank" rel="noopener">{{ r.url[:60] }}{% if r.url | length > 60 %}&hellip;{% endif %}</a></td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
+    {% endif %}
+
+    <h2>Scored &amp; Ranked ({{ scored | length }}) — highest keyword overlap first</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th>
+            <th>Score</th>
+            <th>Title</th>
+            <th>URL</th>
+            <th>Keyword Matches by Category</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for opp in scored %}
+          {% set s = opp.keyword_score | default(0) %}
+          <tr>
+            <td>{{ loop.index }}</td>
+            <td class="score-cell {{ 'score-hi' if s >= 0.1 else ('score-mid' if s >= 0.03 else 'score-lo') }}">{{ "%.3f"|format(s) }}</td>
+            <td class="title-cell">{{ opp.title or "(no title)" }}</td>
+            <td class="url-cell">{% if opp.source_url %}<a href="{{ opp.source_url }}" target="_blank" rel="noopener">{{ opp.source_url[:55] }}{% if opp.source_url | length > 55 %}&hellip;{% endif %}</a>{% else %}&mdash;{% endif %}</td>
+            <td>
+              <div class="kw-section">
+                {% for cat, matches in opp.keyword_matches.items() %}
+                <div class="kw-cat-row">
+                  <span class="kw-cat-label">{{ cat }}</span>
+                  <div class="kw-chips">
+                    {% for kw, hit in matches.items() %}<span class="{{ 'kw-hit' if hit else 'kw-miss' }}">{{ kw }}</span>{% endfor %}
+                  </div>
+                </div>
+                {% endfor %}
+                <p class="opt-line">Optional: {{ opp.optional_keyword_count | default(0) }}/{{ opp.optional_keyword_total | default(0) }} matched</p>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="footer-bar">
+    {% if footer_logo_data_uri %}<img src="{{ footer_logo_data_uri }}" alt="wellConnected">{% endif %}
+    <span>Powered by wellConnected</span>
   </div>
 </body>
 </html>"""
 
 
-def generate_debug_report(total_scraped: int, scored: list[dict], excluded: list[dict]) -> str:
+def _escape_for_html_attr(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _encode_asset_data_uri(path: str) -> str:
+    asset_path = Path(path)
+    if not asset_path.is_file():
+        logger.warning(f"Brand asset not found, skipping: {path}")
+        return ""
+    encoded = base64.b64encode(asset_path.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def generate_debug_report(total_scraped: int, scored: list[dict], excluded: list[dict], output_dir: str = "reports/") -> str:
     report_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-    filepath = "rejection_debug.html"
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    filepath = os.path.join(output_dir, "stats.html")
 
     html = Template(_DEBUG_TEMPLATE).render(
         report_date=report_date,
@@ -942,6 +1718,8 @@ def generate_debug_report(total_scraped: int, scored: list[dict], excluded: list
         scored_count=len(scored),
         excluded=excluded,
         scored=scored,
+        logo_data_uri=_encode_asset_data_uri("assets/logo-reversed.png"),
+        footer_logo_data_uri=_encode_asset_data_uri("assets/wellconnected-footer.png"),
     )
 
     with open(filepath, "w", encoding="utf-8") as f:
@@ -955,25 +1733,11 @@ def run_debug(config: dict) -> None:
     logger.info("=== KEYWORD SCORER DEBUG ===")
     raw = scrape_all(config)
 
-    keywords = config.get("keywords", {})
-    excluded_kws = [kw.lower() for kw in keywords.get("excluded", [])]
-
-    excluded_records = []
-    to_score = []
-    for opp in raw:
-        text = (opp.get("title", "") + " " + opp.get("description", "")).lower()
-        triggered = next((kw for kw in excluded_kws if kw in text), None)
-        if triggered:
-            excluded_records.append({
-                "title": opp.get("title", ""),
-                "url": opp.get("source_url", ""),
-                "triggered_keyword": triggered,
-            })
-        else:
-            to_score.append(opp)
-
+    to_score, excluded_records = _split_excluded(raw, config)
     scored = keyword_filter(to_score, config)
-    filepath = generate_debug_report(len(raw), scored, excluded_records)
+
+    output_dir = config.get("output", {}).get("report", {}).get("output_path", "reports/")
+    filepath = generate_debug_report(len(raw), scored, excluded_records, output_dir)
     webbrowser.open(Path(filepath).resolve().as_uri())
 
 
@@ -988,17 +1752,24 @@ def run_pipeline(config: dict) -> None:
     start = datetime.now()
 
     raw = scrape_all(config)
-    filtered = keyword_filter(raw, config)
+    to_score, excluded_records = _split_excluded(raw, config)
+    filtered = keyword_filter(to_score, config)
+
+    output_dir = config.get("output", {}).get("report", {}).get("output_path", "reports/")
+    stats_path = generate_debug_report(len(raw), filtered, excluded_records, output_dir)
+
     evaluated = llm_evaluate(filtered, config)
     eligible = eligibility_check(evaluated, config)
     save_to_database(eligible, config)
-    report_path = generate_report(eligible, config)
+    report_path = generate_report(eligible, config, stats_filename=os.path.basename(stats_path))
     send_notifications(eligible, report_path, config)
 
     elapsed = (datetime.now() - start).seconds
     logger.info("=" * 50)
     logger.info(f"PIPELINE COMPLETE — {len(eligible)} opportunities — {elapsed}s elapsed")
     logger.info("=" * 50)
+
+    webbrowser.open(Path(report_path).resolve().as_uri())
 
 
 # ──────────────────────────────────────────────────────────────
